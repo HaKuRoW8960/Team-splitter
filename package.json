@@ -1,0 +1,16 @@
+{
+  "name": "discord-vc-team-splitter",
+  "version": "1.0.0",
+  "description": "Discord VCのメンバーを自動認識し、優先人数（例: Valorant 5人フルパ＋残り抽選）やグループ数指定でチーム分け＆VC移動を行うBot＋WebUI",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/splitter.test.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1"
+  }
+}

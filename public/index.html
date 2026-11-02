@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VC Team Splitter — Discord VC自動認識＆チーム抽選アプリ</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- 背景エフェクト -->
+  <div class="bg-glow bg-glow-1"></div>
+  <div class="bg-glow bg-glow-2"></div>
+
+  <!-- トップヘッダー -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-logo">🎲</div>
+      <div>
+        <h1>VC Team Splitter <span class="badge-accent">PRO</span></h1>
+        <p class="subtitle">Discord VCメンバー自動認識 ・ 優先人数フルパ抽選 ＆ 自動VC移動システム</p>
+      </div>
+    </div>
+
+    <div class="connection-bar">
+      <div id="botStatusBadge" class="status-pill status-demo">
+        <span class="status-dot"></span>
+        <span id="botStatusText">スタンドアロン / デモモード動作中</span>
+      </div>
+      <button id="btnSyncDiscord" class="btn btn-secondary btn-sm" title="Discord Botサーバーから最新のVC情報を取得">
+        📡 VC再同期
+      </button>
+      <button id="btnInviteBot" class="btn btn-accent btn-sm" title="普通のDiscordアプリと同じように自分のサーバーへ導入します">
+        ➕ Discordサーバーに導入する
+      </button>
+    </div>
+  </header>
+
+  <main class="main-grid">
+    <!-- 左カラム：VC自動認識 ＆ メンバー管理（除外設定） -->
+    <section class="panel panel-vc">
+      <div class="panel-header">
+        <h2>🔊 1. VCチャンネル ＆ メンバー自動認識</h2>
+        <span id="vcCountBadge" class="count-pill">在室 7人</span>
+      </div>
+
+      <!-- サーバー＆VC選択バー -->
+      <div class="vc-selectors">
+        <div class="field-group">
+          <label for="guildSelect">Discord サーバー</label>
+          <select id="guildSelect" class="input-select">
+            <option value="demo_guild">🎮 デモサーバー (Valorant / Apex 集会所)</option>
+          </select>
+        </div>
+
+        <div class="field-group">
+          <label for="vcSelect">認識中のVCチャンネル</label>
+          <select id="vcSelect" class="input-select">
+            <option value="vc_main">🔊 ロビーVC #1 (7人)</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- クイック人数プリセット（デモ・シミュレーション用） -->
+      <div id="demoQuickBar" class="demo-quick-bar">
+        <span class="demo-label">🧪 VC人数シミュレーション:</span>
+        <button class="chip-btn active" data-demo-count="7">7人 (5フルパ+2)</button>
+        <button class="chip-btn" data-demo-count="8">8人 (5フルパ+3)</button>
+        <button class="chip-btn" data-demo-count="10">10人 (5vs5)</button>
+        <button class="chip-btn" data-demo-count="12">12人 (5+5+2)</button>
+      </div>
+
+      <!-- メンバー手動追加フォーム -->
+      <form id="addMemberForm" class="add-member-bar">
+        <input
+          type="text"
+          id="newMemberInput"
+          class="input-text"
+          placeholder="＋ メンバー名を追加（ゲストや手動追加用）..."
+          maxlength="32"
+        />
+        <button type="submit" class="btn btn-secondary btn-sm">追加</button>
+      </form>
+
+      <div class="member-Section-toolbar">
+        <span class="hint-text">💡 メンバーをクリックすると <strong>「🎯 抽選参加」⇔「👀 観戦・除外」</strong> を切り替えられます</span>
+        <div class="toolbar-links">
+          <button id="btnIncludeAll" class="link-btn">全員参加</button>
+          <span>/</span>
+          <button id="btnClearExcluded" class="link-btn">除外リセット</button>
+        </div>
+      </div>
+
+      <!-- VCメンバー一覧グリッド -->
+      <div id="memberList" class="member-grid"></div>
+
+      <!-- 参加・除外サマリー -->
+      <div class="vc-summary-footer">
+        <div>🎯 抽選対象: <strong id="activeMemberCount" class="text-success">7</strong> 人</div>
+        <div>👀 観戦・除外: <strong id="excludedMemberCount" class="text-muted">0</strong> 人</div>
+      </div>
+    </section>
+
+    <!-- 中央・右カラム：抽選条件設定 ＆ チーム抽選結果 -->
+    <div class="right-column">
+      <!-- 2. 抽選ルール＆人数設定パネル -->
+      <section class="panel panel-rules">
+        <div class="panel-header">
+          <h2>⚙️ 2. チーム分け条件・優先人数設定</h2>
+          <span id="currentRuleBadge" class="rule-badge">🎯 Valorant フルパ優先 (5人)</span>
+        </div>
+
+        <!-- ワンクリック・プリセット一覧 -->
+        <div class="preset-label">定番プリセットから選ぶ</div>
+        <div id="presetGrid" class="preset-grid">
+          <button class="preset-card active" data-preset="valo_5">
+            <span class="preset-icon">🎯</span>
+            <div class="preset-info">
+              <strong>Valorant フルパ優先</strong>
+              <small>5人チームを優先作成＋残り抽選</small>
+            </div>
+          </button>
+
+          <button class="preset-card" data-preset="valo_single_5">
+            <span class="preset-icon">🔫</span>
+            <div class="preset-info">
+              <strong>1組だけ5人フルパ抽選</strong>
+              <small>5人パ×1組＋残りを別グループへ</small>
+            </div>
+          </button>
+
+          <button class="preset-card" data-preset="apex_3">
+            <span class="preset-icon">🛡️</span>
+            <div class="preset-info">
+              <strong>Apex / トリオ優先</strong>
+              <small>3人チームを優先作成＋残り抽選</small>
+            </div>
+          </button>
+
+          <button class="preset-card" data-preset="quad_4">
+            <span class="preset-icon">🍀</span>
+            <div class="preset-info">
+              <strong>4人スクワッド優先</strong>
+              <small>4人チームを優先作成＋残り抽選</small>
+            </div>
+          </button>
+
+          <button class="preset-card" data-preset="duo_2">
+            <span class="preset-icon">👥</span>
+            <div class="preset-info">
+              <strong>デュオ優先 (2人組)</strong>
+              <small>2人ペアを優先作成＋余り1人</small>
+            </div>
+          </button>
+
+          <button class="preset-card" data-preset="valo_custom_10">
+            <span class="preset-icon">⚔️</span>
+            <div class="preset-info">
+              <strong>5 vs 5 カスタム＋観戦</strong>
+              <small>5人×2チーム＋11人目以降は観戦枠</small>
+            </div>
+          </button>
+
+          <button class="preset-card" data-preset="equal_2">
+            <span class="preset-icon">⚖️</span>
+            <div class="preset-info">
+              <strong>2グループ均等分け</strong>
+              <small>全員を半分ずつ2チームに均等配分</small>
+            </div>
+          </button>
+
+          <button class="preset-card" data-preset="equal_3">
+            <span class="preset-icon">📐</span>
+            <div class="preset-info">
+              <strong>3グループ均等分け</strong>
+              <small>全員を3つのチームへ均等配分</small>
+            </div>
+          </button>
+        </div>
+
+        <!-- 詳細モード切り替えタブ (任意の人数・グループ数を自由指定) -->
+        <div class="mode-tabs">
+          <button class="mode-tab active" data-mode="priority">🔢 何人チームを優先するか指定</button>
+          <button class="mode-tab" data-mode="groups">🗂️ 何グループに分けるか指定</button>
+          <button class="mode-tab" data-mode="custom">✏️ 各チームの人数を自由入力</button>
+        </div>
+
+        <!-- モード別カスタム設定エリア -->
+        <div class="mode-config-box">
+          <!-- A: 優先人数モード -->
+          <div id="configPriority" class="mode-pane active">
+            <div class="config-row">
+              <div class="config-field">
+                <label for="prioritySizeInput">優先して作るチームの人数</label>
+                <div class="stepper-control">
+                  <button type="button" class="stepper-btn" data-step="-1" data-target="prioritySizeInput">−</button>
+                  <input type="number" id="prioritySizeInput" value="5" min="1" max="25" />
+                  <span class="unit-label">人チーム優先</span>
+                  <button type="button" class="stepper-btn" data-step="1" data-target="prioritySizeInput">＋</button>
+                </div>
+              </div>
+
+              <div class="config-field">
+                <label for="maxPriorityTeamsSelect">優先チームの作成数上限</label>
+                <select id="maxPriorityTeamsSelect" class="input-select">
+                  <option value="">作れるだけフルパを作る (例: 12人→5+5+2)</option>
+                  <option value="1">1組だけ優先チームを作り残りをまとめる (例: 12人→5+7)</option>
+                  <option value="2">最大2組まで優先チームを作る</option>
+                  <option value="3">最大3組まで優先チームを作る</option>
+                </select>
+              </div>
+            </div>
+            <p class="config-preview" id="priorityPreviewText">
+              📌 現在の設定: <strong>5人チーム</strong>を優先作成し、端数メンバーを残り枠として抽選します（7人の場合: <strong>5人 ＋ 2人</strong>）
+            </p>
+          </div>
+
+          <!-- B: グループ数均等割りモード -->
+          <div id="configGroups" class="mode-pane">
+            <div class="config-row">
+              <div class="config-field">
+                <label for="groupCountInput">分割するグループ数</label>
+                <div class="stepper-control">
+                  <button type="button" class="stepper-btn" data-step="-1" data-target="groupCountInput">−</button>
+                  <input type="number" id="groupCountInput" value="2" min="2" max="15" />
+                  <span class="unit-label">グループに均等分け</span>
+                  <button type="button" class="stepper-btn" data-step="1" data-target="groupCountInput">＋</button>
+                </div>
+              </div>
+            </div>
+            <p class="config-preview" id="groupsPreviewText">
+              📌 現在の設定: 参加メンバーを <strong>2グループ</strong> に人数差が最小になるよう均等分けします
+            </p>
+          </div>
+
+          <!-- C: カスタム配分モード -->
+          <div id="configCustom" class="mode-pane">
+            <div class="config-row">
+              <div class="config-field full-width">
+                <label for="customSizesInput">各グループの人数（カンマまたはスペース区切り）</label>
+                <input
+                  type="text"
+                  id="customSizesInput"
+                  class="input-text"
+                  value="5, 2"
+                  placeholder="例: 5, 2 または 5, 3, 2"
+                />
+              </div>
+            </div>
+            <p class="config-preview">
+              📌 指定した人数順（例: <code>5, 2</code> や <code>4, 3, 2</code>）にグループを作成し、さらに余りが出た場合は余り枠に入れます
+            </p>
+          </div>
+        </div>
+
+        <!-- 抽選実行＆再抽選アクションバー -->
+        <div class="draw-action-bar">
+          <button id="btnDraw" class="btn btn-primary btn-lg">
+            🎲 チーム抽選を実行する！
+          </button>
+          <button id="btnReroll" class="btn btn-accent btn-lg">
+            🔄 再抽選 (シャッフル)
+          </button>
+        </div>
+      </section>
+
+      <!-- 3. 抽選結果＆VC移動アクションパネル -->
+      <section class="panel panel-results">
+        <div class="panel-header">
+          <div>
+            <h2>🏆 3. 抽選結果</h2>
+            <p id="resultSummarySub" class="result-sub">ボタンを押すとここにチーム分け結果が表示されます</p>
+          </div>
+
+          <div class="result-actions">
+            <button id="btnCopyResult" class="btn btn-secondary btn-sm" title="結果をテキストでコピー">
+              📋 結果コピー
+            </button>
+            <button id="btnSendDiscord" class="btn btn-secondary btn-sm" title="Discordのテキストチャットに結果を送信">
+              📢 Discordへ送信
+            </button>
+            <button id="btnOpenMoveModal" class="btn btn-success btn-sm">
+              🔊 別のVCチャンネルへ移動...
+            </button>
+          </div>
+        </div>
+
+        <!-- 結果チームカード表示領域 -->
+        <div id="teamsContainer" class="teams-container"></div>
+
+        <!-- 観戦・除外枠表示 -->
+        <div id="excludedResultBox" class="excluded-result-box hidden">
+          <h4>👀 観戦・抽選除外メンバー</h4>
+          <div id="excludedResultList" class="excluded-chips"></div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <!-- 確認ポップアップモーダル：「別のチャンネルへ移動しますか？」 -->
+  <div id="moveModalBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <span class="modal-icon">🔊</span>
+          <div>
+            <h3>別のVCチャンネルへ移動しますか？</h3>
+            <p>分かれたチームごとにメンバーを指定のボイスチャンネルへ自動移動します</p>
+          </div>
+        </div>
+        <button id="btnCloseMoveModal" class="modal-close-btn" aria-label="閉じる">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="modal-alert">
+          💡 各チームの移動先VCチャンネルを確認・選択して<strong>「✅ 移動を実行する」</strong>を押してください。
+        </div>
+
+        <div id="moveAssignmentsList" class="move-assignments-list"></div>
+
+        <div id="moveStatusMessage" class="move-status-message hidden"></div>
+      </div>
+
+      <div class="modal-footer">
+        <button id="btnGatherOriginalVc" class="btn btn-secondary">
+          🔙 全員を元のVCに集める
+        </button>
+        <div class="modal-footer-right">
+          <button id="btnCancelMove" class="btn btn-ghost">
+            キャンセル
+          </button>
+          <button id="btnConfirmMove" class="btn btn-success">
+            ✅ 移動を実行する
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Discordサーバー導入（招待URL生成＆ワンクリック導入）モーダル -->
+  <div id="inviteModalBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <span class="modal-icon">➕</span>
+          <div>
+            <h3>Discordサーバーにアプリを導入する</h3>
+            <p>普通のDiscord Botと同じように、認証画面から好きなサーバーへ追加できます</p>
+          </div>
+        </div>
+        <button id="btnCloseInviteModal" class="modal-close-btn" aria-label="閉じる">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="modal-alert">
+          ✨ <strong>必要な権限（VCメンバー自動認識・スラッシュコマンド・VC移動）</strong>がすべて自動設定された公式招待リンクを発行します。
+        </div>
+
+        <div class="field-group" style="margin-bottom: 14px;">
+          <label for="clientIdInput">Discord Application ID (Client ID)</label>
+          <input
+            type="text"
+            id="clientIdInput"
+            class="input-text"
+            placeholder="例: 1234567890123456789 (クラウド環境変数設定済みの場合は自動入力されます)"
+          />
+        </div>
+
+        <div class="field-group" style="margin-bottom: 14px;">
+          <label for="generatedInviteUrl">生成されたサーバー導入用URL（友達や別サーバーにも共有可能）</label>
+          <input
+            type="text"
+            id="generatedInviteUrl"
+            class="input-text"
+            readonly
+            placeholder="Application ID を入力するとここに招待URLが生成されます"
+          />
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button id="btnCopyInviteUrl" class="btn btn-secondary">
+          📋 招待URLをコピー
+        </button>
+        <div class="modal-footer-right">
+          <button id="btnOpenInviteLink" class="btn btn-accent">
+            🚀 Discord認証画面を開いて導入する
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- トースト通知 -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
