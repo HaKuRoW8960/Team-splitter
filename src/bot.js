@@ -1,9 +1,9 @@
 /**
  * Discord Bot 実装 (discord.js v14) - クラウド＆マルチサーバー導入対応版
- * - 普通のDiscordアプリと同様に「招待リンク」からどのサーバーに導入しても即座に `/team` が利用可能
- * - スラッシュコマンド `/team` でVC内のメンバーを自動認識して抽選
- * - インタラクティブなセレクトメニュー＆ボタンで「プリセット変更」「除外メンバー選択」「再抽選」に対応
- * - 「🔊 別VCへ移動...」ボタンで「別のチャンネルへ移動しますか？」の確認ダイアログを表示し、合意後に自動移動
+ * - `/team` 実行時はまず設定・準備パネルを表示し、「🎲 チーム振り分け」ボタンを押して初めて抽選を実行
+ * - 「⭐ フルパ確定メンバー選択」と「👀 観戦・除外メンバー選択」の2つの複数選択プルダウンを搭載
+ * - 不要なルール・人数説明文を省いたスッキリ見やすいEmbed表示
+ * - 「🔊 別のVCへ移動...」ボタンで「別のチャンネルへ移動しますか？」の確認ダイアログを表示し、合意後に自動移動
  */
 
 const {
@@ -19,14 +19,13 @@ const {
   ButtonStyle,
   StringSelectMenuBuilder,
   PermissionFlagsBits,
-  OAuth2Scopes,
 } = require('discord.js');
 const { PRESETS, splitMembers, parseCustomSizes } = require('./splitter');
 
 // セッション状態を保持するインメモリストア (sessionId -> state)
 const sessions = new Map();
 
-// 古いセッションの定期クリーンアップ（クラウド無料枠でのメモリリーク防止：6時間経過分を削除）
+// 古いセッションの定期クリーンアップ（6時間経過分を削除）
 setInterval(() => {
   const cutoff = Date.now() - 6 * 60 * 60 * 1000;
   for (const [key, val] of sessions.entries()) {
@@ -53,7 +52,6 @@ function createBotClient() {
  */
 function generateBotInviteUrl(clientId) {
   if (!clientId || clientId === 'your_discord_client_id_here') return null;
-  // ViewChannel (1024) + SendMessages (2048) + Connect (1048576) + MoveMembers (16777216) = 17828864
   const permissions =
     PermissionFlagsBits.ViewChannel |
     PermissionFlagsBits.SendMessages |
@@ -74,7 +72,7 @@ function generateBotInviteUrl(clientId) {
 function getSlashCommands() {
   const teamCommand = new SlashCommandBuilder()
     .setName('team')
-    .setDescription('VCに入っているメンバーを自動認識し、指定した人数・グループ条件で抽選します')
+    .setDescription('VCに入っているメンバーを自動認識し、確定枠や除外枠を選んでチーム振り分けを行います')
     .addStringOption((opt) =>
       opt
         .setName('preset')
@@ -150,23 +148,76 @@ function extractVcMembers(vcChannel, includeBots = false) {
 }
 
 /**
- * 抽選結果の Discord Embed を生成する
+ * 準備中 または 抽選結果の Discord Embed を生成する
+ * （不要な「ルール: ...」「VC在室: ...」のヘッダー説明文は表示しないスッキリ仕様）
  */
 function buildResultEmbed(session) {
-  const { vcName, result } = session;
+  const { vcName, isDrawn, allMembers, options, result } = session;
+  const excludedSet = new Set(options.excludedIds || []);
+  const prioritySet = new Set(options.priorityIds || []);
+
+  // A. まだ「🎲 チーム振り分け」ボタンを押す前の準備画面
+  if (!isDrawn) {
+    const activeMembers = allMembers.filter((m) => !excludedSet.has(m.id));
+    const priorityMembers = activeMembers.filter((m) => prioritySet.has(m.id));
+    const excludedMembers = allMembers.filter((m) => excludedSet.has(m.id));
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle(`🎲 VCチーム振り分け準備 — 🔊 ${vcName}`);
+
+    if (activeMembers.length === 0) {
+      embed.addFields({
+        name: '⚠️ 振り分け対象メンバーがいません',
+        value: '下のプルダウンから除外設定を解除するか、VCにメンバーが入った状態で「📡 VCメンバー再認識」を押してください。',
+      });
+    } else {
+      embed.addFields({
+        name: `🎯 参加メンバー (${activeMembers.length}人)`,
+        value: activeMembers
+          .map((m) =>
+            prioritySet.has(m.id)
+              ? `⭐ <@${m.id}> (${m.displayName}) **[フルパ確定]**`
+              : `• <@${m.id}> (${m.displayName})`
+          )
+          .join('\n'),
+        inline: false,
+      });
+    }
+
+    if (priorityMembers.length > 0) {
+      embed.addFields({
+        name: `⭐ フルパ確定枠 (${priorityMembers.length}人)`,
+        value: priorityMembers.map((m) => `<@${m.id}> (${m.displayName})`).join(' / '),
+        inline: false,
+      });
+    }
+
+    if (excludedMembers.length > 0) {
+      embed.addFields({
+        name: `👀 観戦・抽選除外枠 (${excludedMembers.length}人)`,
+        value: excludedMembers.map((m) => `<@${m.id}> (${m.displayName})`).join(' / '),
+        inline: false,
+      });
+    }
+
+    embed.setFooter({
+      text: 'プルダウンで確定枠・除外メンバーを選択し、「🎲 チーム振り分け」ボタンを押してください',
+    });
+
+    return embed;
+  }
+
+  // B. 「🎲 チーム振り分け」ボタンを押した後の抽選結果画面
   const embed = new EmbedBuilder()
     .setColor(0xff4655)
     .setTitle(`🎲 VCチーム抽選結果 — 🔊 ${vcName}`)
-    .setDescription(
-      `**ルール:** ${result.summary}\n` +
-        `**VC在室:** ${result.totalVcMembers}人 （抽選対象: **${result.activeCount}人** / 除外・観戦: **${result.excludedMembers.length}人**）`
-    )
     .setTimestamp(new Date(result.timestamp));
 
   if (result.teams.length === 0) {
     embed.addFields({
       name: '⚠️ 抽選対象メンバーがいません',
-      value: '除外設定を解除するか、VCにメンバーが入った状態で再抽選してください。',
+      value: '除外設定を解除するか、VCにメンバーが入った状態で「🎲 チーム振り分け」を押してください。',
     });
   } else {
     result.teams.forEach((team, idx) => {
@@ -174,7 +225,10 @@ function buildResultEmbed(session) {
       const memberLines =
         team.members.length > 0
           ? team.members
-              .map((m, i) => `\`${i + 1}.\` <@${m.id}> (${m.displayName})`)
+              .map((m, i) => {
+                const star = m.isPriority ? ' ⭐' : '';
+                return `\`${i + 1}.\` <@${m.id}> (${m.displayName})${star}`;
+              })
               .join('\n')
           : '*(なし)*';
       embed.addFields({
@@ -194,14 +248,18 @@ function buildResultEmbed(session) {
   }
 
   embed.setFooter({
-    text: '下のメニューから除外メンバーの設定・ルール変更・再抽選・別VCへの移動が可能です',
+    text: 'もう一度「🎲 チーム振り分け」を押すと再抽選できます',
   });
 
   return embed;
 }
 
 /**
- * インタラクティブ操作用のコンポーネント行を生成する
+ * インタラクティブ操作用のコンポーネント行を生成する（最大4行）
+ * 1行目: プリセット・ルール選択
+ * 2行目: ⭐ 確定でフルパ側に入るメンバー選択（複数選択可）
+ * 3行目: 👀 観戦・抽選から除外するメンバー選択（複数選択可）
+ * 4行目: 🎲 チーム振り分け / 📡 VCメンバー再認識 / 🔊 別のVCへ移動... / 🌐 Web UIで開く
  */
 function buildControlComponents(session, publicUrl) {
   const rows = [];
@@ -221,10 +279,35 @@ function buildControlComponents(session, publicUrl) {
     );
   rows.push(new ActionRowBuilder().addComponents(presetSelect));
 
-  // 2. 除外（観戦）メンバー選択メニュー（最大25人）
   if (session.allMembers.length > 0) {
-    const memberOptions = session.allMembers.slice(0, 25).map((m) => {
-      const isExcluded = session.options.excludedIds.includes(m.id);
+    const slicedMembers = session.allMembers.slice(0, 25);
+
+    // 2. ⭐ 確定でフルパ側に入るメンバー選択メニュー（複数選択可）
+    const priorityOptions = slicedMembers.map((m) => {
+      const isPriority = (session.options.priorityIds || []).includes(m.id);
+      return {
+        label: `${m.displayName}`,
+        description: isPriority
+          ? '現在: ⭐ フルパ確定枠に設定中'
+          : '選択すると確定でフルパ（メインチーム）側に入ります',
+        value: m.id,
+        emoji: isPriority ? '⭐' : '👤',
+        default: isPriority,
+      };
+    });
+
+    const prioritySelect = new StringSelectMenuBuilder()
+      .setCustomId(`priority_${session.id}`)
+      .setPlaceholder('⭐ 確定でフルパ側に入るメンバーを選択（複数選択可）...')
+      .setMinValues(0)
+      .setMaxValues(priorityOptions.length)
+      .addOptions(priorityOptions);
+
+    rows.push(new ActionRowBuilder().addComponents(prioritySelect));
+
+    // 3. 👀 除外（観戦・離席）メンバー選択メニュー（複数選択可）
+    const excludeOptions = slicedMembers.map((m) => {
+      const isExcluded = (session.options.excludedIds || []).includes(m.id);
       return {
         label: `${m.displayName}`,
         description: isExcluded ? '現在: 👀 観戦・抽選から除外中' : '現在: 🎯 抽選に参加',
@@ -238,18 +321,21 @@ function buildControlComponents(session, publicUrl) {
       .setCustomId(`exclude_${session.id}`)
       .setPlaceholder('👀 抽選から除外（観戦・離席）するメンバーを選択...')
       .setMinValues(0)
-      .setMaxValues(memberOptions.length)
-      .addOptions(memberOptions);
+      .setMaxValues(excludeOptions.length)
+      .addOptions(excludeOptions);
 
     rows.push(new ActionRowBuilder().addComponents(excludeSelect));
   }
 
-  // 3. アクションボタン行（再抽選 / VCメンバー再取得 / 別VCへ移動確認 / Web UI）
+  // 4. アクションボタン行
+  const canMoveVc =
+    session.isDrawn && session.result && session.result.teams && session.result.teams.length > 0;
+
   const btnRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`reroll_${session.id}`)
-      .setLabel('再抽選 (シャッフル)')
-      .setEmoji('🔄')
+      .setLabel('チーム振り分け')
+      .setEmoji('🎲')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
       .setCustomId(`refresh_${session.id}`)
@@ -261,7 +347,7 @@ function buildControlComponents(session, publicUrl) {
       .setLabel('別のVCへ移動...')
       .setEmoji('🔊')
       .setStyle(ButtonStyle.Success)
-      .setDisabled(session.result.teams.length < 1)
+      .setDisabled(!canMoveVc)
   );
 
   if (publicUrl && publicUrl.startsWith('http')) {
@@ -425,14 +511,12 @@ async function setupBot(client, config = {}) {
         const rest = new REST({ version: '10' }).setToken(token);
         const commands = getSlashCommands();
 
-        // 1. グローバルコマンドとして登録（すべてのサーバーで利用可能に）
         await rest.put(Routes.applicationCommands(resolvedClientId), {
           body: commands,
         });
         console.log(`🌐 グローバルスラッシュコマンド [/team] を登録しました`);
 
-        // 2. 現在導入済みの全サーバーにも即時反映（最大1時間のグローバル反映待ちをゼロにする）
-        for (const [gId, g] of client.guilds.cache) {
+        for (const [gId] of client.guilds.cache) {
           await rest
             .put(Routes.applicationGuildCommands(resolvedClientId, gId), {
               body: commands,
@@ -452,7 +536,6 @@ async function setupBot(client, config = {}) {
     }
   });
 
-  // 新しいサーバーに招待された瞬間にそのサーバーへ `/team` コマンドを即時登録
   client.on('guildCreate', async (guild) => {
     try {
       const resolvedClientId = config.clientId || client.user?.id;
@@ -510,6 +593,7 @@ async function setupBot(client, config = {}) {
 
         let splitOptions = {
           excludedIds: [],
+          priorityIds: [],
           mode: 'priority',
           prioritySize: 5,
           maxPriorityTeams: null,
@@ -539,9 +623,9 @@ async function setupBot(client, config = {}) {
           activePresetId = 'valo_5';
         }
 
-        const result = splitMembers(allMembers, splitOptions);
         const sessionId = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
+        // 初期状態は isDrawn: false（まだチーム振り分けを実行せず、確定枠・除外枠を選べる準備画面）
         const session = {
           id: sessionId,
           createdAt: Date.now(),
@@ -552,7 +636,8 @@ async function setupBot(client, config = {}) {
           presetId: activePresetId,
           allMembers,
           options: splitOptions,
-          result,
+          isDrawn: false,
+          result: null,
           moveTargets: {},
         };
         sessions.set(sessionId, session);
@@ -592,6 +677,7 @@ async function setupBot(client, config = {}) {
           });
         }
 
+        // プリセット変更（設定を更新し、「🎲 チーム振り分け」ボタンを押すまで待機状態にする）
         if (act === 'preset' && interaction.isStringSelectMenu()) {
           const chosenKey = interaction.values[0];
           const preset = PRESETS[chosenKey];
@@ -606,7 +692,7 @@ async function setupBot(client, config = {}) {
               customSizes: preset.customSizes || [],
               teamNames: preset.teamNames || [],
             };
-            session.result = splitMembers(session.allMembers, session.options);
+            session.isDrawn = false;
             session.moveTargets = {};
           }
           return interaction.update({
@@ -615,9 +701,14 @@ async function setupBot(client, config = {}) {
           });
         }
 
-        if (act === 'exclude' && interaction.isStringSelectMenu()) {
-          session.options.excludedIds = interaction.values;
-          session.result = splitMembers(session.allMembers, session.options);
+        // ⭐ フルパ確定メンバー選択変更（選んだ人が除外枠にいた場合は除外から外す）
+        if (act === 'priority' && interaction.isStringSelectMenu()) {
+          session.options.priorityIds = interaction.values;
+          const prioSet = new Set(interaction.values);
+          session.options.excludedIds = (session.options.excludedIds || []).filter(
+            (id) => !prioSet.has(id)
+          );
+          session.isDrawn = false;
           session.moveTargets = {};
           return interaction.update({
             embeds: [buildResultEmbed(session)],
@@ -625,19 +716,38 @@ async function setupBot(client, config = {}) {
           });
         }
 
-        if (act === 'reroll' && interaction.isButton()) {
-          session.result = splitMembers(session.allMembers, session.options);
+        // 👀 除外メンバー選択変更（選んだ人がフルパ確定枠にいた場合は確定枠から外す）
+        if (act === 'exclude' && interaction.isStringSelectMenu()) {
+          session.options.excludedIds = interaction.values;
+          const exclSet = new Set(interaction.values);
+          session.options.priorityIds = (session.options.priorityIds || []).filter(
+            (id) => !exclSet.has(id)
+          );
+          session.isDrawn = false;
+          session.moveTargets = {};
           return interaction.update({
             embeds: [buildResultEmbed(session)],
             components: buildControlComponents(session, publicUrl),
           });
         }
 
+        // 🎲 チーム振り分けボタン（ここで初めて抽選・振り分けを実行！2回目以降は再抽選として機能）
+        if (act === 'reroll' && interaction.isButton()) {
+          session.result = splitMembers(session.allMembers, session.options);
+          session.isDrawn = true;
+          session.moveTargets = {};
+          return interaction.update({
+            embeds: [buildResultEmbed(session)],
+            components: buildControlComponents(session, publicUrl),
+          });
+        }
+
+        // 📡 VCメンバー再認識ボタン
         if (act === 'refresh' && interaction.isButton()) {
           const vc = interaction.guild.channels.cache.get(session.vcId);
           if (vc) {
             session.allMembers = extractVcMembers(vc, session.includeBots);
-            session.result = splitMembers(session.allMembers, session.options);
+            session.isDrawn = false;
             session.moveTargets = {};
           }
           return interaction.update({
@@ -646,7 +756,14 @@ async function setupBot(client, config = {}) {
           });
         }
 
+        // 🔊 別のVCへ移動...ボタン
         if (act === 'askmove' && interaction.isButton()) {
+          if (!session.isDrawn || !session.result) {
+            return interaction.reply({
+              content: '⚠️ 先に「🎲 チーム振り分け」ボタンを押してチームを決定してください。',
+              ephemeral: true,
+            });
+          }
           const payload = buildMoveConfirmationPayload(session, interaction.guild);
           return interaction.reply(payload);
         }

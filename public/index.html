@@ -82,21 +82,22 @@
       </form>
 
       <div class="member-Section-toolbar">
-        <span class="hint-text">💡 メンバーをクリックすると <strong>「🎯 抽選参加」⇔「👀 観戦・除外」</strong> を切り替えられます</span>
+        <span class="hint-text">💡 クリックで <strong>「🎯 抽選参加」➔「⭐ フルパ確定」➔「👀 観戦・除外」</strong> を切り替え</span>
         <div class="toolbar-links">
-          <button id="btnIncludeAll" class="link-btn">全員参加</button>
+          <button id="btnIncludeAll" class="link-btn">全員リセット</button>
           <span>/</span>
-          <button id="btnClearExcluded" class="link-btn">除外リセット</button>
+          <button id="btnClearExcluded" class="link-btn">除外解除</button>
         </div>
       </div>
 
       <!-- VCメンバー一覧グリッド -->
       <div id="memberList" class="member-grid"></div>
 
-      <!-- 参加・除外サマリー -->
+      <!-- 参加・確定・除外サマリー -->
       <div class="vc-summary-footer">
-        <div>🎯 抽選対象: <strong id="activeMemberCount" class="text-success">7</strong> 人</div>
-        <div>👀 観戦・除外: <strong id="excludedMemberCount" class="text-muted">0</strong> 人</div>
+        <div>🎯 参加: <strong id="activeMemberCount" class="text-success">7</strong>人</div>
+        <div>⭐ フルパ確定: <strong id="priorityMemberCount" style="color: #fbbf24;">0</strong>人</div>
+        <div>👀 除外: <strong id="excludedMemberCount" class="text-muted">0</strong>人</div>
       </div>
     </section>
 
@@ -255,10 +256,10 @@
         <!-- 抽選実行＆再抽選アクションバー -->
         <div class="draw-action-bar">
           <button id="btnDraw" class="btn btn-primary btn-lg">
-            🎲 チーム抽選を実行する！
+            🎲 チーム振り分けを実行する！
           </button>
           <button id="btnReroll" class="btn btn-accent btn-lg">
-            🔄 再抽選 (シャッフル)
+            🔄 再振り分け (シャッフル)
           </button>
         </div>
       </section>

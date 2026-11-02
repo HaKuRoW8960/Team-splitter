@@ -186,10 +186,6 @@ function createWebServer(botClient, config = {}) {
       const embed = new EmbedBuilder()
         .setColor(0xff4655)
         .setTitle(`🎲 VCチーム抽選結果 (Web UI) — 🔊 ${vcName || 'VC'}`)
-        .setDescription(
-          `**ルール:** ${result.summary}\n` +
-            `**参加:** ${result.activeCount}人 / **観戦・除外:** ${result.excludedMembers?.length || 0}人`
-        )
         .setTimestamp(new Date());
 
       (result.teams || []).forEach((team, idx) => {
@@ -197,11 +193,12 @@ function createWebServer(botClient, config = {}) {
         const lines =
           team.members.length > 0
             ? team.members
-                .map((m, i) =>
-                  m.id && !String(m.id).startsWith('demo_')
-                    ? `\`${i + 1}.\` <@${m.id}> (${m.displayName})`
-                    : `\`${i + 1}.\` ${m.displayName}`
-                )
+                .map((m, i) => {
+                  const star = m.isPriority ? ' ⭐' : '';
+                  return m.id && !String(m.id).startsWith('demo_')
+                    ? `\`${i + 1}.\` <@${m.id}> (${m.displayName})${star}`
+                    : `\`${i + 1}.\` ${m.displayName}${star}`;
+                })
                 .join('\n')
             : '*(なし)*';
         embed.addFields({

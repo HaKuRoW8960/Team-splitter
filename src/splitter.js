@@ -4,7 +4,7 @@
  * 対応モード:
  * 1. priority (優先人数指定モード)
  *    - 例: 7人中 5人チームを優先作成 → [チーム1 (5人), 余り/チーム2 (2人)]
- *    - maxPriorityTeams を指定すると作成するフルパ数の上限を制限可能 (例: 1組だけ5人を作る / 可能な限り5人を作る)
+ *    - priorityIds に指定されたメンバーは確定でフルパ（優先チーム）側に入る
  * 2. groups (グループ数均等割りモード)
  *    - 例: 7人を 2グループに均等分け → [チーム1 (4人), チーム2 (3人)]
  * 3. custom (カスタム人数リスト指定モード)
@@ -17,10 +17,10 @@ const PRESETS = {
   valo_5: {
     id: 'valo_5',
     name: 'Valorant フルパ優先 (5人)',
-    description: '5人フルパを優先して作成し、残りのメンバーを別グループ（デュオ/トリオ/待機枠）に分けます',
+    description: '5人フルパを優先して作成し、残りのメンバーを別グループに分けます',
     mode: 'priority',
     prioritySize: 5,
-    maxPriorityTeams: null, // 制限なし（10人なら5+5、7人なら5+2）
+    maxPriorityTeams: null,
     icon: '🎯',
   },
   valo_single_5: {
@@ -122,42 +122,37 @@ function parseCustomSizes(input) {
  * @param {Array<{id: string, displayName: string, username?: string, avatarUrl?: string}>} allMembers VC内の全メンバー
  * @param {Object} options
  * @param {string[]} [options.excludedIds=[]] 抽選から除外（観戦・離席）するメンバーID配列
+ * @param {string[]} [options.priorityIds=[]] 確定でフルパ（優先チーム）側に入るメンバーID配列
  * @param {'priority'|'groups'|'custom'} [options.mode='priority'] 分割モード
  * @param {number} [options.prioritySize=5] 優先チームの人数 (mode === 'priority' 時)
  * @param {number|null} [options.maxPriorityTeams=null] 優先チームの最大作成数 (null なら作れるだけ作成)
  * @param {number} [options.groupCount=2] 均等分けのグループ数 (mode === 'groups' 時)
  * @param {number[]|string} [options.customSizes=[]] カスタム人数配列 (mode === 'custom' 時)
  * @param {string[]} [options.teamNames=[]] カスタムチーム名リスト
- * @returns {{
- *   mode: string,
- *   summary: string,
- *   totalVcMembers: number,
- *   activeCount: number,
- *   teams: Array<{
- *     index: number,
- *     name: string,
- *     isRemainder: boolean,
- *     targetSize: number | null,
- *     members: Array
- *   }>,
- *   excludedMembers: Array,
- *   timestamp: string
- * }}
  */
 function splitMembers(allMembers, options = {}) {
   const excludedSet = new Set(options.excludedIds || []);
-  const activeMembers = [];
+  const prioritySet = new Set(options.priorityIds || []);
+
+  const fixedMembers = [];
+  const normalMembers = [];
   const excludedMembers = [];
 
   for (const member of allMembers) {
     if (excludedSet.has(member.id)) {
-      excludedMembers.push(member);
+      excludedMembers.push({ ...member, isPriority: false });
+    } else if (prioritySet.has(member.id)) {
+      fixedMembers.push({ ...member, isPriority: true });
     } else {
-      activeMembers.push(member);
+      normalMembers.push({ ...member, isPriority: false });
     }
   }
 
-  const shuffled = shuffleArray(activeMembers);
+  // 確定メンバーを先頭に配置し、残りの枠を通常メンバーのシャッフルで埋める
+  const shuffledFixed = shuffleArray(fixedMembers);
+  const shuffledNormal = shuffleArray(normalMembers);
+  const shuffled = [...shuffledFixed, ...shuffledNormal];
+
   const mode = options.mode || 'priority';
   const teams = [];
   let summary = '';
@@ -195,7 +190,7 @@ function splitMembers(allMembers, options = {}) {
         members: remainder,
       });
     }
-    summary = `カスタム配分 [${sizes.join(' + ')}人] で抽選`;
+    summary = `カスタム配分 [${sizes.join(' + ')}人]`;
   } else if (mode === 'groups') {
     const groupCount = Math.max(1, Math.min(20, parseInt(options.groupCount, 10) || 2));
     const actualGroups = Math.min(groupCount, Math.max(1, shuffled.length));
@@ -215,7 +210,7 @@ function splitMembers(allMembers, options = {}) {
         members: slice,
       });
     }
-    summary = `${groupCount}グループ均等分け（計 ${shuffled.length}人）`;
+    summary = `${groupCount}グループ均等分け`;
   } else {
     // Default: 'priority' mode (例: 5人優先で7人なら [5人フルパ, 残り2人])
     const prioritySize = Math.max(1, parseInt(options.prioritySize, 10) || 5);
@@ -263,15 +258,16 @@ function splitMembers(allMembers, options = {}) {
 
     summary =
       maxTeams === 1
-        ? `${prioritySize}人チーム×1組を優先抽選 ＋ 残り枠（計 ${shuffled.length}人）`
-        : `${prioritySize}人チーム優先作成 ＋ 残り枠（計 ${shuffled.length}人）`;
+        ? `${prioritySize}人チーム×1組優先 ＋ 残り枠`
+        : `${prioritySize}人チーム優先 ＋ 残り枠`;
   }
 
   return {
     mode,
     summary,
     totalVcMembers: allMembers.length,
-    activeCount: activeMembers.length,
+    activeCount: shuffled.length,
+    priorityMembers: shuffledFixed,
     teams,
     excludedMembers,
     timestamp: new Date().toISOString(),

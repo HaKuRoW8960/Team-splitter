@@ -1,8 +1,7 @@
 /**
  * VC Team Splitter - 本格 Web UI フロントエンドロジック
- * - Discord Bot サーバーと接続時はリアルタイムでVCチャンネルと在室メンバーを自動認識
- * - Bot未接続時やローカル直接起動時でも、7人VC（5人Valorantフルパ＋残り2人）等を即座に試せるデモモード内蔵
- * - 「別のVCチャンネルへ移動しますか？」確認ポップアップ＆VC移動実行機能を搭載
+ * - メンバーをクリックして「🎯 抽選参加 ➔ ⭐ フルパ確定 ➔ 👀 観戦・除外」を切り替え可能
+ * - 「🎲 チーム振り分けを実行する！」ボタンを押して初めて振り分け結果を表示
  */
 
 const PRESET_DEFINITIONS = {
@@ -96,11 +95,12 @@ const state = {
   textChannels: [],
   currentVcId: 'vc_main',
   currentVcName: 'ロビーVC #1 (集会場)',
-  members: DEMO_PLAYERS_POOL.slice(0, 7), // 初期状態: ご要望の例に合わせ7人在室
+  members: DEMO_PLAYERS_POOL.slice(0, 7),
+  priorityIds: new Set(),
   excludedIds: new Set(),
 
   activePreset: 'valo_5',
-  mode: 'priority', // 'priority' | 'groups' | 'custom'
+  mode: 'priority',
   prioritySize: 5,
   maxPriorityTeams: null,
   groupCount: 2,
@@ -131,20 +131,23 @@ function parseCustomSizes(input) {
     .filter((n) => Number.isInteger(n) && n > 0);
 }
 
-// クライアント側抽選エンジン（サーバーAPIとも完全互換）
+// クライアント側抽選エンジン（確定枠 priorityIds 対応）
 function runLocalSplit() {
-  const activeMembers = [];
+  const fixedMembers = [];
+  const normalMembers = [];
   const excludedMembers = [];
 
   for (const m of state.members) {
     if (state.excludedIds.has(m.id)) {
-      excludedMembers.push(m);
+      excludedMembers.push({ ...m, isPriority: false });
+    } else if (state.priorityIds.has(m.id)) {
+      fixedMembers.push({ ...m, isPriority: true });
     } else {
-      activeMembers.push(m);
+      normalMembers.push({ ...m, isPriority: false });
     }
   }
 
-  const shuffled = shuffleArray(activeMembers);
+  const shuffled = [...shuffleArray(fixedMembers), ...shuffleArray(normalMembers)];
   const teams = [];
   let summary = '';
 
@@ -180,7 +183,7 @@ function runLocalSplit() {
         members: remainder,
       });
     }
-    summary = `カスタム配分 [${sizes.join(' + ')}人] で抽選`;
+    summary = `カスタム配分 [${sizes.join(' + ')}人]`;
   } else if (state.mode === 'groups') {
     const groupCount = Math.max(1, Math.min(20, parseInt(state.groupCount, 10) || 2));
     const actualGroups = Math.min(groupCount, Math.max(1, shuffled.length));
@@ -200,9 +203,8 @@ function runLocalSplit() {
         members: slice,
       });
     }
-    summary = `${groupCount}グループ均等分け（計 ${shuffled.length}人）`;
+    summary = `${groupCount}グループ均等分け`;
   } else {
-    // priority モード
     const prioritySize = Math.max(1, parseInt(state.prioritySize, 10) || 5);
     const maxTeams =
       state.maxPriorityTeams && state.maxPriorityTeams > 0
@@ -247,22 +249,21 @@ function runLocalSplit() {
 
     summary =
       maxTeams === 1
-        ? `${prioritySize}人チーム×1組を優先作成 ＋ 残り抽選（参加 ${shuffled.length}人）`
-        : `${prioritySize}人フルパ優先作成 ＋ 残り抽選（参加 ${shuffled.length}人）`;
+        ? `${prioritySize}人チーム×1組優先 ＋ 残り抽選`
+        : `${prioritySize}人フルパ優先 ＋ 残り抽選`;
   }
 
   return {
     mode: state.mode,
     summary,
     totalVcMembers: state.members.length,
-    activeCount: activeMembers.length,
+    activeCount: shuffled.length,
     teams,
     excludedMembers,
     timestamp: new Date().toISOString(),
   };
 }
 
-// トースト表示
 function showToast(message) {
   const container = document.getElementById('toastContainer');
   const toast = document.createElement('div');
@@ -274,21 +275,25 @@ function showToast(message) {
   }, 3500);
 }
 
-// メンバー一覧の描画
+// メンバー一覧の描画（クリックで 参加 ➔ フルパ確定 ➔ 観戦除外 をサイクル）
 function renderMemberList() {
   const listEl = document.getElementById('memberList');
   listEl.innerHTML = '';
 
   const totalCount = state.members.length;
   const excludedCount = state.members.filter((m) => state.excludedIds.has(m.id)).length;
+  const priorityCount = state.members.filter((m) => state.priorityIds.has(m.id)).length;
   const activeCount = totalCount - excludedCount;
 
   document.getElementById('vcCountBadge').textContent = `在室 ${totalCount}人`;
   document.getElementById('activeMemberCount').textContent = activeCount;
+  const prioEl = document.getElementById('priorityMemberCount');
+  if (prioEl) prioEl.textContent = priorityCount;
   document.getElementById('excludedMemberCount').textContent = excludedCount;
 
   state.members.forEach((member) => {
     const isExcluded = state.excludedIds.has(member.id);
+    const isPriority = state.priorityIds.has(member.id);
     const item = document.createElement('div');
     item.className = `member-item ${isExcluded ? 'excluded' : ''}`;
 
@@ -296,6 +301,16 @@ function renderMemberList() {
     const avatarHtml = member.avatarUrl
       ? `<img src="${member.avatarUrl}" alt="${member.displayName}" />`
       : initials;
+
+    let tagClass = 'active';
+    let tagLabel = '🎯 抽選参加';
+    if (isPriority) {
+      tagClass = 'priority';
+      tagLabel = '⭐ フルパ確定';
+    } else if (isExcluded) {
+      tagClass = 'spectator';
+      tagLabel = '👀 観戦・除外';
+    }
 
     item.innerHTML = `
       <div class="member-left">
@@ -305,20 +320,23 @@ function renderMemberList() {
         </div>
       </div>
       <div class="member-right">
-        <span class="status-tag ${isExcluded ? 'spectator' : 'active'}">
-          ${isExcluded ? '👀 観戦・除外' : '🎯 抽選参加'}
+        <span class="status-tag ${tagClass}">
+          ${tagLabel}
         </span>
         <button class="remove-member-btn" title="リストから削除" data-remove-id="${member.id}">✕</button>
       </div>
     `;
 
-    // クリックで参加⇔観戦（除外）トグル
+    // クリックで 🎯抽選参加 ➔ ⭐フルパ確定 ➔ 👀観戦・除外 ➔ 🎯抽選参加 の順に切り替え
     item.addEventListener('click', (e) => {
       if (e.target.closest('.remove-member-btn')) return;
-      if (state.excludedIds.has(member.id)) {
-        state.excludedIds.delete(member.id);
-      } else {
+      if (!state.priorityIds.has(member.id) && !state.excludedIds.has(member.id)) {
+        state.priorityIds.add(member.id);
+      } else if (state.priorityIds.has(member.id)) {
+        state.priorityIds.delete(member.id);
         state.excludedIds.add(member.id);
+      } else {
+        state.excludedIds.delete(member.id);
       }
       renderMemberList();
       updateConfigPreviewText();
@@ -328,6 +346,7 @@ function renderMemberList() {
     removeBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       state.members = state.members.filter((m) => m.id !== member.id);
+      state.priorityIds.delete(member.id);
       state.excludedIds.delete(member.id);
       renderMemberList();
       updateConfigPreviewText();
@@ -339,7 +358,6 @@ function renderMemberList() {
   updateConfigPreviewText();
 }
 
-// プレビュー説明文の動的更新（例：7人いる時に5人優先なら「5人 ＋ 2人」と具体的に表示）
 function updateConfigPreviewText() {
   const activeCount = state.members.filter((m) => !state.excludedIds.has(m.id)).length;
   const pSize = Math.max(1, parseInt(state.prioritySize, 10) || 5);
@@ -375,6 +393,21 @@ function updateConfigPreviewText() {
   }
 }
 
+// 準備中（未振り分け）状態の案内表示
+function renderPendingState() {
+  state.lastResult = null;
+  const container = document.getElementById('teamsContainer');
+  document.getElementById('resultSummarySub').textContent =
+    'メンバーの確定枠・除外枠を設定し、「🎲 チーム振り分けを実行する！」を押してください';
+  container.innerHTML = `
+    <div class="config-preview" style="padding: 18px; text-align: center; border: 1px dashed rgba(255,255,255,0.15); border-radius: 10px;">
+      ⏳ <strong>振り分け待機中</strong><br/>
+      左のリストで「⭐ フルパ確定」や「👀 観戦・除外」を設定したら、上の <strong>「🎲 チーム振り分けを実行する！」</strong> ボタンを押してください。
+    </div>
+  `;
+  document.getElementById('excludedResultBox').classList.add('hidden');
+}
+
 // 抽選結果の描画
 function renderLotteryResult(result) {
   state.lastResult = result;
@@ -382,7 +415,7 @@ function renderLotteryResult(result) {
   container.innerHTML = '';
 
   document.getElementById('resultSummarySub').textContent =
-    `${result.summary} （実行時刻: ${new Date(result.timestamp).toLocaleTimeString('ja-JP')}）`;
+    `実行時刻: ${new Date(result.timestamp).toLocaleTimeString('ja-JP')}`;
 
   if (result.teams.length === 0) {
     container.innerHTML = `<div class="config-preview">⚠️ 抽選対象メンバーが0人です。左のリストから観戦・除外設定を解除するかメンバーを追加してください。</div>`;
@@ -402,7 +435,7 @@ function renderLotteryResult(result) {
           (m, i) => `
           <li class="team-member-row">
             <span class="member-index">#${i + 1}</span>
-            <strong>${m.displayName}</strong>
+            <strong>${m.displayName}${m.isPriority ? ' ⭐' : ''}</strong>
           </li>
         `
         )
@@ -422,7 +455,6 @@ function renderLotteryResult(result) {
     });
   }
 
-  // 観戦・除外メンバー枠の表示
   const excludedBox = document.getElementById('excludedResultBox');
   const excludedList = document.getElementById('excludedResultList');
   if (result.excludedMembers && result.excludedMembers.length > 0) {
@@ -435,10 +467,9 @@ function renderLotteryResult(result) {
   }
 }
 
-// 「別のVCチャンネルへ移動しますか？」確認ポップアップモーダルを開く
 function openMoveConfirmationModal() {
   if (!state.lastResult || state.lastResult.teams.length === 0) {
-    showToast('⚠️ 先にチーム抽選を実行してください');
+    showToast('⚠️ 先に「🎲 チーム振り分けを実行する！」を押してください');
     return;
   }
 
@@ -446,7 +477,6 @@ function openMoveConfirmationModal() {
   listEl.innerHTML = '';
   document.getElementById('moveStatusMessage').classList.add('hidden');
 
-  // 各チームのデフォルト移動先VCを設定
   state.lastResult.teams.forEach((team, idx) => {
     if (!state.moveTargets[team.index]) {
       if (idx === 0) {
@@ -495,7 +525,6 @@ function openMoveConfirmationModal() {
   document.getElementById('moveModalBackdrop').classList.remove('hidden');
 }
 
-// VC移動実行処理
 async function executeMoveFromModal(gatherToOriginal = false) {
   if (!state.lastResult) return;
 
@@ -532,7 +561,6 @@ async function executeMoveFromModal(gatherToOriginal = false) {
       statusBox.textContent = `⚠️ エラー: ${err.message}`;
     }
   } else {
-    // デモモードでのシミュレーション表示
     const summaryLines = state.lastResult.teams.map((t) => {
       const vc = state.voiceChannels.find((v) => v.id === targets[t.index]);
       return `・<strong>${t.name}</strong> (${t.members.length}人) ➔ 🔊 <strong>${
@@ -546,14 +574,12 @@ async function executeMoveFromModal(gatherToOriginal = false) {
   }
 }
 
-// Discord OAuth2 招待リンク生成ヘルパー (ViewChannel + SendMessages + Connect + MoveMembers = 17828864)
 function buildClientInviteUrl(clientId) {
   const cleanId = String(clientId || '').trim();
   if (!/^\d{15,22}$/.test(cleanId)) return '';
   return `https://discord.com/oauth2/authorize?client_id=${cleanId}&permissions=17828864&scope=bot%20applications.commands`;
 }
 
-// Discord Bot バックエンドとの同期処理
 async function syncWithDiscordBackend() {
   try {
     const res = await fetch('/api/status');
@@ -599,9 +625,7 @@ async function syncWithDiscordBackend() {
 
       await loadGuildVoiceChannels(state.currentGuildId, paramVcId);
     }
-  } catch (_) {
-    // ローカルで index.html を直接開いた場合やBot未接続時はそのままデモモードで動作
-  }
+  } catch (_) {}
 }
 
 async function loadGuildVoiceChannels(guildId, preferredVcId = null) {
@@ -626,7 +650,6 @@ async function loadGuildVoiceChannels(guildId, preferredVcId = null) {
       )
       .join('');
 
-    // 優先VCまたは最も人が多く入っているVCを自動選択
     let chosenVc =
       state.voiceChannels.find((v) => v.id === preferredVcId) ||
       [...state.voiceChannels].sort((a, b) => b.memberCount - a.memberCount)[0];
@@ -637,10 +660,11 @@ async function loadGuildVoiceChannels(guildId, preferredVcId = null) {
       vcSelect.value = chosenVc.id;
       if (chosenVc.members.length > 0) {
         state.members = chosenVc.members;
+        state.priorityIds.clear();
         state.excludedIds.clear();
         renderMemberList();
-        executeLottery();
-        showToast(`🔊 「${chosenVc.name}」の在室メンバー ${chosenVc.members.length}人を自動認識しました`);
+        renderPendingState();
+        showToast(`🔊 「${chosenVc.name}」の在室メンバー ${chosenVc.members.length}人を認識しました`);
       }
     }
   } catch (err) {
@@ -648,7 +672,6 @@ async function loadGuildVoiceChannels(guildId, preferredVcId = null) {
   }
 }
 
-// モードタブのUI切り替え
 function setModeUI(mode) {
   state.mode = mode;
   document.querySelectorAll('.mode-tab').forEach((tab) => {
@@ -667,7 +690,6 @@ function setModeUI(mode) {
   updateConfigPreviewText();
 }
 
-// プリセットの適用
 function applyPreset(presetId) {
   const preset = PRESET_DEFINITIONS[presetId];
   if (!preset) return;
@@ -696,24 +718,19 @@ function applyPreset(presetId) {
     document.getElementById('customSizesInput').value = state.customSizes;
     setModeUI('custom');
   }
-
-  executeLottery();
 }
 
-// 抽選の実行
 function executeLottery() {
   state.moveTargets = {};
   const result = runLocalSplit();
   renderLotteryResult(result);
 }
 
-// 初期化＆イベント登録
 window.addEventListener('DOMContentLoaded', () => {
   renderMemberList();
-  executeLottery();
+  renderPendingState();
   syncWithDiscordBackend();
 
-  // デモ人数ワンクリック切り替えボタン
   document.querySelectorAll('[data-demo-count]').forEach((btn) => {
     btn.addEventListener('click', () => {
       document
@@ -722,14 +739,14 @@ window.addEventListener('DOMContentLoaded', () => {
       btn.classList.add('active');
       const count = parseInt(btn.dataset.demoCount, 10) || 7;
       state.members = DEMO_PLAYERS_POOL.slice(0, count);
+      state.priorityIds.clear();
       state.excludedIds.clear();
       renderMemberList();
-      executeLottery();
-      showToast(`🧪 VC在室メンバーを ${count}人 に設定して抽選しました`);
+      renderPendingState();
+      showToast(`🧪 VC在室メンバーを ${count}人 に設定しました`);
     });
   });
 
-  // メンバー手動追加
   document.getElementById('addMemberForm').addEventListener('submit', (e) => {
     e.preventDefault();
     const input = document.getElementById('newMemberInput');
@@ -741,34 +758,31 @@ window.addEventListener('DOMContentLoaded', () => {
     });
     input.value = '';
     renderMemberList();
-    executeLottery();
   });
 
-  // 全員参加 / 除外リセット
-  const resetExcluded = () => {
+  document.getElementById('btnIncludeAll').addEventListener('click', () => {
+    state.priorityIds.clear();
     state.excludedIds.clear();
     renderMemberList();
-    executeLottery();
-  };
-  document.getElementById('btnIncludeAll').addEventListener('click', resetExcluded);
-  document.getElementById('btnClearExcluded').addEventListener('click', resetExcluded);
+  });
 
-  // プリセット選択
+  document.getElementById('btnClearExcluded').addEventListener('click', () => {
+    state.excludedIds.clear();
+    renderMemberList();
+  });
+
   document.querySelectorAll('.preset-card').forEach((card) => {
     card.addEventListener('click', () => {
       applyPreset(card.dataset.preset);
     });
   });
 
-  // モードタブ切り替え
   document.querySelectorAll('.mode-tab').forEach((tab) => {
     tab.addEventListener('click', () => {
       setModeUI(tab.dataset.mode);
-      executeLottery();
     });
   });
 
-  // ステッパー (+ / -) ボタン
   document.querySelectorAll('.stepper-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       const targetId = btn.dataset.target;
@@ -782,52 +796,50 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  // 優先人数・上限・グループ数・カスタム入力の変更監視
   document.getElementById('prioritySizeInput').addEventListener('input', (e) => {
     state.prioritySize = parseInt(e.target.value, 10) || 5;
     document.getElementById('currentRuleBadge').textContent = `🔢 ${state.prioritySize}人チーム優先`;
     updateConfigPreviewText();
-    executeLottery();
   });
 
   document.getElementById('maxPriorityTeamsSelect').addEventListener('change', (e) => {
     state.maxPriorityTeams = e.target.value ? parseInt(e.target.value, 10) : null;
     updateConfigPreviewText();
-    executeLottery();
   });
 
   document.getElementById('groupCountInput').addEventListener('input', (e) => {
     state.groupCount = parseInt(e.target.value, 10) || 2;
     document.getElementById('currentRuleBadge').textContent = `🗂️ ${state.groupCount}グループ均等分け`;
     updateConfigPreviewText();
-    executeLottery();
   });
 
   document.getElementById('customSizesInput').addEventListener('input', (e) => {
     state.customSizes = e.target.value;
     state.teamNames = [];
     document.getElementById('currentRuleBadge').textContent = `✏️ カスタム [${state.customSizes}]`;
-    executeLottery();
   });
 
-  // 抽選＆再抽選ボタン
+  // 🎲 チーム振り分けボタン ＆ 再振り分けボタン
   document.getElementById('btnDraw').addEventListener('click', () => {
     executeLottery();
-    showToast('🎲 チーム抽選を実行しました！');
+    showToast('🎲 チーム振り分けを実行しました！');
   });
 
   document.getElementById('btnReroll').addEventListener('click', () => {
     executeLottery();
-    showToast('🔄 メンバーを再シャッフルしました！');
+    showToast('🔄 メンバーを再振り分けしました！');
   });
 
-  // 結果コピーボタン
   document.getElementById('btnCopyResult').addEventListener('click', () => {
     if (!state.lastResult) return;
-    const lines = [`🎲 【VCチーム抽選結果】 (${state.lastResult.summary})`];
+    const lines = [`🎲 【VCチーム抽選結果】`];
     state.lastResult.teams.forEach((t) => {
       lines.push(`\n■ ${t.name}`);
-      lines.push(t.members.map((m, i) => `  ${i + 1}. ${m.displayName}`).join('\n'));
+      lines.push(
+        t.members
+          .map((m, i) => `  ${i + 1}. ${m.displayName}${m.isPriority ? ' ⭐' : ''}`)
+          .join('\n')
+      );
     });
     if (state.lastResult.excludedMembers?.length > 0) {
       lines.push(
@@ -837,12 +849,15 @@ window.addEventListener('DOMContentLoaded', () => {
       );
     }
     navigator.clipboard.writeText(lines.join('\n')).then(() => {
-      showToast('📋 抽選結果をクリップボードにコピーしました！Discordに貼り付けられます');
+      showToast('📋 抽選結果をクリップボードにコピーしました！');
     });
   });
 
-  // Discordへ結果送信ボタン
   document.getElementById('btnSendDiscord').addEventListener('click', async () => {
+    if (!state.lastResult) {
+      showToast('⚠️ 先に「🎲 チーム振り分けを実行する！」を押してください');
+      return;
+    }
     if (!state.botReady || state.currentGuildId === 'demo_guild') {
       showToast('💡 Discord未接続のため、代わりに結果をクリップボードにコピーしました');
       document.getElementById('btnCopyResult').click();
@@ -866,7 +881,6 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // 「別のVCチャンネルへ移動...」確認モーダル開閉＆実行
   document
     .getElementById('btnOpenMoveModal')
     .addEventListener('click', openMoveConfirmationModal);
@@ -885,7 +899,6 @@ window.addEventListener('DOMContentLoaded', () => {
     executeMoveFromModal(true);
   });
 
-  // サーバー・VC選択変更
   document.getElementById('guildSelect').addEventListener('change', (e) => {
     state.currentGuildId = e.target.value;
     if (state.currentGuildId !== 'demo_guild') {
@@ -901,9 +914,10 @@ window.addEventListener('DOMContentLoaded', () => {
       state.currentVcName = found.name;
       if (found.members) {
         state.members = found.members;
+        state.priorityIds.clear();
         state.excludedIds.clear();
         renderMemberList();
-        executeLottery();
+        renderPendingState();
       }
     }
   });
@@ -917,7 +931,6 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // 「➕ Discordサーバーに導入する」モーダル＆ワンクリック導入機能
   const inviteModal = document.getElementById('inviteModalBackdrop');
   const clientIdInput = document.getElementById('clientIdInput');
   const generatedInviteUrlInput = document.getElementById('generatedInviteUrl');
@@ -959,7 +972,6 @@ window.addEventListener('DOMContentLoaded', () => {
     window.open(url, '_blank', 'noopener,noreferrer');
   });
 
-  // URLパラメータ `?openInviteModal=1` の場合は自動で導入モーダルを表示
   if (new URLSearchParams(window.location.search).get('openInviteModal') === '1') {
     inviteModal.classList.remove('hidden');
   }

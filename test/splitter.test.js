@@ -47,4 +47,16 @@ assert.deepStrictEqual(
   [3, 2, 2]
 );
 
+// テスト5: フルパ確定枠 (priorityIds) に指定したメンバーが必ず第1チーム（5人フルパ）に入ること
+for (let trial = 0; trial < 20; trial++) {
+  const resPriority = splitMembers(mock7Players, {
+    mode: 'priority',
+    prioritySize: 5,
+    priorityIds: ['user_2', 'user_6'],
+  });
+  const mainTeamIds = resPriority.teams[0].members.map((m) => m.id);
+  assert.ok(mainTeamIds.includes('user_2'), 'user_2 は必ずフルパ側に入る');
+  assert.ok(mainTeamIds.includes('user_6'), 'user_6 は必ずフルパ側に入る');
+}
+
 console.log('✅ 全テストケース成功！');
