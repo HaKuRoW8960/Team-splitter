@@ -1,9 +1,9 @@
 /**
- * Web UI 用 Express サーバー & REST API (クラウド無料枠・ワンクリック導入対応版)
+ * Web UI 用 Express サーバー & REST API
  * - `/healthz`: Render / Koyeb 等のクラウドヘルスチェック＆スリープ防止用エンドポイント
  * - `/invite`: 普通のDiscordアプリと同様にサーバーへワンクリック導入できる OAuth2 リダイレクト
  * - Discord Bot とリアルタイム連携し、サーバー一覧・VC一覧・VC内メンバーを自動取得
- * - Web UI 上で「別のチャンネルへ移動しますか？」ポップアップを承認した際のVC一括移動APIを提供
+ * - Web UI からの読み上げBot操作・テキスト読み上げ送信にも対応
  */
 
 const express = require('express');
@@ -12,25 +12,32 @@ const path = require('path');
 const { ChannelType, EmbedBuilder } = require('discord.js');
 const { PRESETS, splitMembers } = require('./splitter');
 const { extractVcMembers, executeTeamMove, generateBotInviteUrl } = require('./bot');
+const { VOICE_PRESETS, ttsSessions, joinVcForTts, sanitizeTextForTts } = require('./tts');
 
-function createWebServer(botClient, config = {}) {
+function resolveClient(botClientOrHolder) {
+  if (!botClientOrHolder) return null;
+  return botClientOrHolder.client ? botClientOrHolder.client : botClientOrHolder;
+}
+
+function createWebServer(botClientOrHolder, config = {}) {
   const app = express();
   app.use(cors());
   app.use(express.json());
   app.use(express.static(path.join(__dirname, '..', 'public')));
 
-  // 0. クラウド無料枠 (Render / Koyeb / UptimeRobot) 用ヘルスチェックエンドポイント
   app.get('/healthz', (req, res) => {
+    const botClient = resolveClient(botClientOrHolder);
     res.status(200).json({
       ok: true,
       botReady: Boolean(botClient && botClient.isReady()),
+      messageContentEnabled: Boolean(botClient && botClient.messageContentEnabled),
       uptime: Math.floor(process.uptime()),
       timestamp: new Date().toISOString(),
     });
   });
 
-  // 0.5 ワンクリックでDiscordサーバーへ導入する招待URLリダイレクト (`/invite`)
   app.get('/invite', (req, res) => {
+    const botClient = resolveClient(botClientOrHolder);
     const clientId =
       req.query.clientId ||
       config.clientId ||
@@ -43,8 +50,8 @@ function createWebServer(botClient, config = {}) {
     return res.redirect(inviteUrl);
   });
 
-  // 1. ステータス＆招待URL＆プリセット一覧＆参加サーバー一覧取得
   app.get('/api/status', (req, res) => {
+    const botClient = resolveClient(botClientOrHolder);
     const isReady = Boolean(botClient && botClient.isReady());
     const resolvedClientId =
       config.clientId || (isReady && botClient.user ? botClient.user.id : null);
@@ -62,16 +69,18 @@ function createWebServer(botClient, config = {}) {
     res.json({
       botReady: isReady,
       botTag: isReady ? botClient.user.tag : null,
+      messageContentEnabled: Boolean(botClient && botClient.messageContentEnabled),
       clientId: resolvedClientId,
       inviteUrl,
       guilds,
       presets: PRESETS,
+      voices: VOICE_PRESETS,
     });
   });
 
-  // 2. 指定サーバー内の全VCチャンネル＆入室中メンバー一覧取得
   app.get('/api/guilds/:guildId/vcs', async (req, res) => {
     try {
+      const botClient = resolveClient(botClientOrHolder);
       if (!botClient || !botClient.isReady()) {
         return res.status(503).json({
           error: 'Discord Bot が未接続です（デモモードで動作中）',
@@ -110,18 +119,27 @@ function createWebServer(botClient, config = {}) {
           name: tc.name,
         }));
 
+      const activeTts = ttsSessions.get(guild.id);
+
       res.json({
         guildId: guild.id,
         guildName: guild.name,
         voiceChannels,
         textChannels,
+        ttsStatus: activeTts
+          ? {
+              connected: true,
+              vcId: activeTts.vcId,
+              vcName: activeTts.vcName,
+              defaultVoice: activeTts.defaultVoice,
+            }
+          : { connected: false },
       });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // 3. サーバーサイド抽選エンドポイント
   app.post('/api/split', (req, res) => {
     try {
       const { members = [], options = {} } = req.body;
@@ -132,9 +150,9 @@ function createWebServer(botClient, config = {}) {
     }
   });
 
-  // 4. Web UI の確認ポップアップ承認後に各チームを別VCへ移動するエンドポイント
   app.post('/api/guilds/:guildId/move', async (req, res) => {
     try {
+      const botClient = resolveClient(botClientOrHolder);
       if (!botClient || !botClient.isReady()) {
         return res.status(503).json({
           error: 'Discord Bot が未接続のため、実際のVC移動はBot起動時に利用可能です。',
@@ -163,9 +181,56 @@ function createWebServer(botClient, config = {}) {
     }
   });
 
-  // 5. Web UI の抽選結果を Discord チャンネル（またはVC内チャット）へ送信するエンドポイント
+  // Web UI から読み上げBotの参加・退出・発話を操作するエンドポイント
+  app.post('/api/guilds/:guildId/tts', async (req, res) => {
+    try {
+      const botClient = resolveClient(botClientOrHolder);
+      if (!botClient || !botClient.isReady()) {
+        return res.status(503).json({ error: 'Discord Bot が未接続です' });
+      }
+      const guild = botClient.guilds.cache.get(req.params.guildId);
+      if (!guild) {
+        return res.status(404).json({ error: 'サーバーが見つかりません' });
+      }
+
+      const { action, vcId, voiceId = 'zunda_normal', text } = req.body;
+
+      if (action === 'leave') {
+        const existing = ttsSessions.get(guild.id);
+        if (existing) existing.destroy();
+        return res.json({ success: true, connected: false });
+      }
+
+      let session = ttsSessions.get(guild.id);
+      if (action === 'join' || (!session && vcId)) {
+        const vc = guild.channels.cache.get(vcId);
+        if (!vc) return res.status(400).json({ error: 'VCチャンネルが見つかりません' });
+        session = joinVcForTts(guild, vc, vc.id, voiceId);
+      }
+
+      if (session && voiceId && VOICE_PRESETS[voiceId]) {
+        session.defaultVoice = voiceId;
+      }
+
+      if (session && text) {
+        session.enqueue(sanitizeTextForTts(text, guild), voiceId || session.defaultVoice);
+      }
+
+      return res.json({
+        success: true,
+        connected: Boolean(session),
+        vcId: session?.vcId,
+        vcName: session?.vcName,
+        defaultVoice: session?.defaultVoice,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.post('/api/guilds/:guildId/announce', async (req, res) => {
     try {
+      const botClient = resolveClient(botClientOrHolder);
       if (!botClient || !botClient.isReady()) {
         return res.status(503).json({
           error: 'Discord Bot が未接続です。',

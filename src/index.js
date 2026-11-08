@@ -1,6 +1,6 @@
 /**
  * エントリーポイント: クラウド完全対応 (Render / Koyeb / Railway / Fly.io 無料枠対応)
- * Discord Bot + Web UI サーバーの同時起動
+ * Discord Bot (VCチーム抽選 ＋ ずんだもん・ゆっくりボイス読み上げ) + Web UI サーバーの同時起動
  */
 
 require('dotenv').config();
@@ -10,7 +10,6 @@ const { createWebServer } = require('./server');
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 
-// クラウド環境変数 (Render / Koyeb / Railway) から自動的に公開URLを検出
 const detectedCloudUrl =
   process.env.PUBLIC_URL ||
   process.env.RENDER_EXTERNAL_URL ||
@@ -23,7 +22,12 @@ const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
 
 async function main() {
-  const botClient = createBotClient();
+  let botClient = createBotClient(true);
+  const botHolder = {
+    get client() {
+      return botClient;
+    },
+  };
 
   await setupBot(botClient, {
     token: DISCORD_TOKEN,
@@ -32,7 +36,7 @@ async function main() {
     publicUrl: detectedCloudUrl,
   });
 
-  const app = createWebServer(botClient, {
+  const app = createWebServer(botHolder, {
     publicUrl: detectedCloudUrl,
     clientId: DISCORD_CLIENT_ID,
   });
@@ -48,7 +52,6 @@ async function main() {
     console.log('====================================================');
   });
 
-  // クラウド環境で稼働中かつ KEEP_ALIVE_URL または RENDER_EXTERNAL_URL がある場合、14分おきにヘルスチェックを実行
   const keepAliveTarget = process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL;
   if (keepAliveTarget && keepAliveTarget.startsWith('http')) {
     setInterval(() => {
@@ -60,8 +63,25 @@ async function main() {
     try {
       await botClient.login(DISCORD_TOKEN);
     } catch (err) {
-      console.error('❌ Discord Bot ログイン失敗 (環境変数 DISCORD_TOKEN を確認してください):', err.message);
-      console.log('💡 Web UI はデモモードとして引き続き利用可能です。');
+      // もし Discord Developer Portal で MESSAGE CONTENT INTENT がまだ ON になっていない場合は自動でフォールバックして起動を維持
+      if (String(err.message || '').includes('DisallowedIntents')) {
+        console.warn(
+          '⚠️ MESSAGE CONTENT INTENT が Developer Portal で未有効のため、フォールバックモードでログインします。'
+        );
+        try {
+          botClient.destroy();
+        } catch (_) {}
+        botClient = createBotClient(false);
+        await setupBot(botClient, {
+          token: DISCORD_TOKEN,
+          clientId: DISCORD_CLIENT_ID,
+          guildId: DISCORD_GUILD_ID,
+          publicUrl: detectedCloudUrl,
+        });
+        await botClient.login(DISCORD_TOKEN);
+      } else {
+        console.error('❌ Discord Bot ログイン失敗:', err.message);
+      }
     }
   } else {
     console.log(

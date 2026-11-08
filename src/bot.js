@@ -1,9 +1,11 @@
 /**
- * Discord Bot 実装 (discord.js v14) - クラウド＆マルチサーバー導入対応版
- * - `/team` 実行時はまず設定・準備パネルを表示し、「🎲 チーム振り分け」ボタンを押して初めて抽選を実行
- * - 「⭐ フルパ確定メンバー選択」と「👀 観戦・除外メンバー選択」の2つの複数選択プルダウンを搭載
- * - 不要なルール・人数説明文を省いたスッキリ見やすいEmbed表示
- * - 「🔊 別のVCへ移動...」ボタンで「別のチャンネルへ移動しますか？」の確認ダイアログを表示し、合意後に自動移動
+ * Discord Bot 実装 (discord.js v14)
+ * 1. VCメンバー自動認識 ＆ チーム振り分け (`/team`)
+ *    - 準備画面表示 ➔ ⭐フルパ確定枠・👀除外枠プルダウン選択 ➔ 「🎲 チーム振り分け」で抽選
+ *    - 「🔊 別のVCへ移動...」確認ポップアップ＆自動VC移動
+ * 2. VCテキストチャット自動読み上げBot機能 (`/join`, `/leave`, `/voice`, `/say`)
+ *    - ずんだもん（ノーマル・あまあま・ツンツン・ささやき）、ゆっくりボイス（霊夢風・魔理沙風）、四国めたん、春日部つむぎ等に対応
+ *    - VCのチャット欄に入力されたテキストを自動認識してボイス再生
  */
 
 const {
@@ -21,6 +23,13 @@ const {
   PermissionFlagsBits,
 } = require('discord.js');
 const { PRESETS, splitMembers, parseCustomSizes } = require('./splitter');
+const {
+  VOICE_PRESETS,
+  ttsSessions,
+  userVoicePrefs,
+  sanitizeTextForTts,
+  joinVcForTts,
+} = require('./tts');
 
 // セッション状態を保持するインメモリストア (sessionId -> state)
 const sessions = new Map();
@@ -35,15 +44,19 @@ setInterval(() => {
   }
 }, 30 * 60 * 1000).unref();
 
-function createBotClient() {
-  const client = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildVoiceStates,
-      GatewayIntentBits.GuildMembers,
-    ],
-  });
+function createBotClient(enableMessageContent = true) {
+  const intents = [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+  ];
+  if (enableMessageContent) {
+    intents.push(GatewayIntentBits.MessageContent);
+  }
 
+  const client = new Client({ intents });
+  client.messageContentEnabled = enableMessageContent;
   return client;
 }
 
@@ -56,6 +69,7 @@ function generateBotInviteUrl(clientId) {
     PermissionFlagsBits.ViewChannel |
     PermissionFlagsBits.SendMessages |
     PermissionFlagsBits.Connect |
+    PermissionFlagsBits.Speak |
     PermissionFlagsBits.MoveMembers;
 
   return (
@@ -67,9 +81,14 @@ function generateBotInviteUrl(clientId) {
 }
 
 /**
- * スラッシュコマンド定義
+ * スラッシュコマンド定義 (`/team`, `/join`, `/leave`, `/voice`, `/say`)
  */
 function getSlashCommands() {
+  const voiceChoices = Object.values(VOICE_PRESETS).map((v) => ({
+    name: `${v.emoji} ${v.name}`,
+    value: v.id,
+  }));
+
   const teamCommand = new SlashCommandBuilder()
     .setName('team')
     .setDescription('VCに入っているメンバーを自動認識し、確定枠や除外枠を選んでチーム振り分けを行います')
@@ -125,7 +144,70 @@ function getSlashCommands() {
         .setRequired(false)
     );
 
-  return [teamCommand.toJSON()];
+  const joinCommand = new SlashCommandBuilder()
+    .setName('join')
+    .setDescription('VCに参加して、VCチャット欄に入力された文字をずんだもんやゆっくりボイスで読み上げます')
+    .addStringOption((opt) =>
+      opt
+        .setName('voice')
+        .setDescription('読み上げボイスを選択（デフォルト: ずんだもん ノーマル）')
+        .setRequired(false)
+        .addChoices(...voiceChoices)
+    )
+    .addChannelOption((opt) =>
+      opt
+        .setName('vc_channel')
+        .setDescription('参加するVCチャンネル（省略時はあなたが現在入っているVC）')
+        .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)
+        .setRequired(false)
+    );
+
+  const leaveCommand = new SlashCommandBuilder()
+    .setName('leave')
+    .setDescription('読み上げBotをVCから退出させます');
+
+  const voiceCommand = new SlashCommandBuilder()
+    .setName('voice')
+    .setDescription('読み上げの声（ずんだもん・ゆっくりボイス等）を変更します')
+    .addStringOption((opt) =>
+      opt
+        .setName('voice')
+        .setDescription('変更するボイスを選択')
+        .setRequired(true)
+        .addChoices(...voiceChoices)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('target')
+        .setDescription('自分の声だけ変えるか、サーバー全体のデフォルトを変えるか（省略時は自分の声）')
+        .setRequired(false)
+        .addChoices(
+          { name: '👤 自分の発言の声だけ変更する', value: 'user' },
+          { name: '🌐 サーバー全体のデフォルト声として変更する', value: 'guild' }
+        )
+    );
+
+  const sayCommand = new SlashCommandBuilder()
+    .setName('say')
+    .setDescription('指定したテキストをVCで今すぐ読み上げます')
+    .addStringOption((opt) =>
+      opt.setName('text').setDescription('読み上げる文章').setRequired(true)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName('voice')
+        .setDescription('声の指定（省略時は現在の設定）')
+        .setRequired(false)
+        .addChoices(...voiceChoices)
+    );
+
+  return [
+    teamCommand.toJSON(),
+    joinCommand.toJSON(),
+    leaveCommand.toJSON(),
+    voiceCommand.toJSON(),
+    sayCommand.toJSON(),
+  ];
 }
 
 /**
@@ -148,15 +230,77 @@ function extractVcMembers(vcChannel, includeBots = false) {
 }
 
 /**
+ * 読み上げBotコントロールパネルの Embed & Components を構築する
+ */
+function buildTtsControlPayload(ttsSession, messageContentEnabled = true, clientId = '') {
+  const voicePreset = VOICE_PRESETS[ttsSession.defaultVoice] || VOICE_PRESETS.zunda_normal;
+
+  let desc =
+    `**接続中のVC:** 🔊 **${ttsSession.vcName}**\n` +
+    `**現在のデフォルト声:** ${voicePreset.emoji} **${voicePreset.name}**\n` +
+    `**発言者名の読み上げ:** ${ttsSession.readSpeakerName ? '⭕ ON' : '✖ OFF'}\n\n` +
+    `💬 **🔊 ${ttsSession.vcName} のVCチャット欄**（またはこのチャンネル）に文字を入力すると自動で読み上げます！\n` +
+    `💡 \`/voice\` コマンドで人ごとに別々の声（ずんだもん・ゆっくり等）を設定することも可能です。`;
+
+  if (!messageContentEnabled) {
+    const portalUrl = clientId
+      ? `https://discord.com/developers/applications/${clientId}/bot`
+      : 'https://discord.com/developers/applications';
+    desc +=
+      `\n\n⚠️ **【重要】通常のチャット入力を自動認識するための設定**\n` +
+      `[Discord Developer Portal の Bot 設定画面](${portalUrl}) を開き、**「MESSAGE CONTENT INTENT」** を **ON** にして保存してください（ONにする前でも \`/say 文章\` で読み上げ可能です）。`;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0x2ecc71)
+    .setTitle(`🗣️ ずんだもん＆ゆっくり 読み上げBot 稼働中！`)
+    .setDescription(desc);
+
+  const voiceSelect = new StringSelectMenuBuilder()
+    .setCustomId(`ttsvoice_${ttsSession.guildId}`)
+    .setPlaceholder('🎙️ 読み上げボイス（ずんだもん・ゆっくり等）を切り替え...')
+    .addOptions(
+      Object.values(VOICE_PRESETS).map((v) => ({
+        label: v.name,
+        description: v.description.slice(0, 95),
+        value: v.id,
+        emoji: v.emoji,
+        default: ttsSession.defaultVoice === v.id,
+      }))
+    );
+
+  const btnRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`ttsskip_${ttsSession.guildId}`)
+      .setLabel('読み上げスキップ')
+      .setEmoji('🔇')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`ttsname_${ttsSession.guildId}`)
+      .setLabel(ttsSession.readSpeakerName ? '名前読み上げ: ON' : '名前読み上げ: OFF')
+      .setEmoji('👤')
+      .setStyle(ttsSession.readSpeakerName ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`ttsleave_${ttsSession.guildId}`)
+      .setLabel('VCから退出')
+      .setEmoji('👋')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return {
+    embeds: [embed],
+    components: [new ActionRowBuilder().addComponents(voiceSelect), btnRow],
+  };
+}
+
+/**
  * 準備中 または 抽選結果の Discord Embed を生成する
- * （不要な「ルール: ...」「VC在室: ...」のヘッダー説明文は表示しないスッキリ仕様）
  */
 function buildResultEmbed(session) {
   const { vcName, isDrawn, allMembers, options, result } = session;
   const excludedSet = new Set(options.excludedIds || []);
   const prioritySet = new Set(options.priorityIds || []);
 
-  // A. まだ「🎲 チーム振り分け」ボタンを押す前の準備画面
   if (!isDrawn) {
     const activeMembers = allMembers.filter((m) => !excludedSet.has(m.id));
     const priorityMembers = activeMembers.filter((m) => prioritySet.has(m.id));
@@ -208,7 +352,6 @@ function buildResultEmbed(session) {
     return embed;
   }
 
-  // B. 「🎲 チーム振り分け」ボタンを押した後の抽選結果画面
   const embed = new EmbedBuilder()
     .setColor(0xff4655)
     .setTitle(`🎲 VCチーム抽選結果 — 🔊 ${vcName}`)
@@ -256,15 +399,10 @@ function buildResultEmbed(session) {
 
 /**
  * インタラクティブ操作用のコンポーネント行を生成する（最大4行）
- * 1行目: プリセット・ルール選択
- * 2行目: ⭐ 確定でフルパ側に入るメンバー選択（複数選択可）
- * 3行目: 👀 観戦・抽選から除外するメンバー選択（複数選択可）
- * 4行目: 🎲 チーム振り分け / 📡 VCメンバー再認識 / 🔊 別のVCへ移動... / 🌐 Web UIで開く
  */
 function buildControlComponents(session, publicUrl) {
   const rows = [];
 
-  // 1. プリセット・ルール切り替えメニュー
   const presetSelect = new StringSelectMenuBuilder()
     .setCustomId(`preset_${session.id}`)
     .setPlaceholder('⚙️ 抽選ルール・優先人数を変更...')
@@ -282,7 +420,6 @@ function buildControlComponents(session, publicUrl) {
   if (session.allMembers.length > 0) {
     const slicedMembers = session.allMembers.slice(0, 25);
 
-    // 2. ⭐ 確定でフルパ側に入るメンバー選択メニュー（複数選択可）
     const priorityOptions = slicedMembers.map((m) => {
       const isPriority = (session.options.priorityIds || []).includes(m.id);
       return {
@@ -305,7 +442,6 @@ function buildControlComponents(session, publicUrl) {
 
     rows.push(new ActionRowBuilder().addComponents(prioritySelect));
 
-    // 3. 👀 除外（観戦・離席）メンバー選択メニュー（複数選択可）
     const excludeOptions = slicedMembers.map((m) => {
       const isExcluded = (session.options.excludedIds || []).includes(m.id);
       return {
@@ -327,7 +463,6 @@ function buildControlComponents(session, publicUrl) {
     rows.push(new ActionRowBuilder().addComponents(excludeSelect));
   }
 
-  // 4. アクションボタン行
   const canMoveVc =
     session.isDrawn && session.result && session.result.teams && session.result.teams.length > 0;
 
@@ -347,7 +482,12 @@ function buildControlComponents(session, publicUrl) {
       .setLabel('別のVCへ移動...')
       .setEmoji('🔊')
       .setStyle(ButtonStyle.Success)
-      .setDisabled(!canMoveVc)
+      .setDisabled(!canMoveVc),
+    new ButtonBuilder()
+      .setCustomId(`ttsjoin_${session.id}`)
+      .setLabel('読み上げBotを呼ぶ')
+      .setEmoji('🗣️')
+      .setStyle(ButtonStyle.Secondary)
   );
 
   if (publicUrl && publicUrl.startsWith('http')) {
@@ -357,7 +497,7 @@ function buildControlComponents(session, publicUrl) {
       if (session.vcId) url.searchParams.set('vcId', session.vcId);
       btnRow.addComponents(
         new ButtonBuilder()
-          .setLabel('Web UIで開く')
+          .setLabel('Web UI')
           .setEmoji('🌐')
           .setStyle(ButtonStyle.Link)
           .setURL(url.toString())
@@ -501,9 +641,9 @@ async function setupBot(client, config = {}) {
     const resolvedClientId = config.clientId || client.user.id;
     const inviteUrl = generateBotInviteUrl(resolvedClientId);
 
-    console.log(`✅ Discord Bot ログイン完了: ${client.user.tag}`);
+    console.log(`✅ Discord Bot ログイン完了: ${client.user.tag} (MessageContent: ${client.messageContentEnabled})`);
     if (inviteUrl) {
-      console.log(`🔗 サーバー招待URL (ここから導入するだけ): ${inviteUrl}`);
+      console.log(`🔗 サーバー招待URL: ${inviteUrl}`);
     }
 
     if (token && resolvedClientId) {
@@ -514,7 +654,7 @@ async function setupBot(client, config = {}) {
         await rest.put(Routes.applicationCommands(resolvedClientId), {
           body: commands,
         });
-        console.log(`🌐 グローバルスラッシュコマンド [/team] を登録しました`);
+        console.log(`🌐 スラッシュコマンド [/team, /join, /leave, /voice, /say] を登録しました`);
 
         for (const [gId] of client.guilds.cache) {
           await rest
@@ -544,17 +684,84 @@ async function setupBot(client, config = {}) {
       await rest.put(Routes.applicationGuildCommands(resolvedClientId, guild.id), {
         body: getSlashCommands(),
       });
-      console.log(`🎉 新規サーバー「${guild.name}」に導入され、[/team] コマンドを即時有効化しました！`);
     } catch (err) {
       console.warn(`⚠️ 新規サーバー (${guild.name}) へのコマンド即時登録失敗:`, err.message);
     }
   });
 
+  // 🗣️ VC内テキストチャット（および紐付けチャンネル）のメッセージ自動読み上げ
+  client.on('messageCreate', async (message) => {
+    try {
+      if (!message.guild || message.author.bot) return;
+      const ttsSession = ttsSessions.get(message.guild.id);
+      if (!ttsSession) return;
+
+      // 読み上げ対象チャンネル（VC自体のチャット欄 または /join を実行したチャンネル）かチェック
+      if (!ttsSession.boundChannelIds.has(message.channel.id)) return;
+
+      const raw = (message.content || '').trim();
+      if (!raw) return;
+
+      // 's' または 'skip' だけ入力された場合は読み上げスキップ
+      if (raw === 's' || raw === 'skip' || raw === 'ｓ') {
+        ttsSession.skip();
+        return;
+      }
+
+      const cleaned = sanitizeTextForTts(raw, message.guild);
+      if (!cleaned) return;
+
+      const speakerName = message.member?.displayName || message.author.username;
+      const finalText = ttsSession.readSpeakerName
+        ? `${speakerName}さん、${cleaned}`
+        : cleaned;
+
+      // 発言者個人のボイス設定があればそれを優先し、なければサーバーのデフォルトボイスを使用
+      const voiceId = userVoicePrefs.get(message.author.id) || ttsSession.defaultVoice;
+      ttsSession.enqueue(finalText, voiceId);
+    } catch (err) {
+      console.error('TTS messageCreate error:', err.message);
+    }
+  });
+
+  // VCから人間が全員いなくなったら読み上げBotを自動退出させる
+  client.on('voiceStateUpdate', (oldState, newState) => {
+    try {
+      const guild = oldState.guild || newState.guild;
+      if (!guild) return;
+      const ttsSession = ttsSessions.get(guild.id);
+      if (!ttsSession) return;
+
+      const vc = guild.channels.cache.get(ttsSession.vcId);
+      if (!vc) {
+        ttsSession.destroy();
+        return;
+      }
+
+      const humanMembers = vc.members.filter((m) => !m.user.bot);
+      if (humanMembers.size === 0) {
+        setTimeout(() => {
+          const currentSession = ttsSessions.get(guild.id);
+          const currentVc = guild.channels.cache.get(ttsSession.vcId);
+          if (
+            currentSession &&
+            currentVc &&
+            currentVc.members.filter((m) => !m.user.bot).size === 0
+          ) {
+            currentSession.destroy();
+          }
+        }, 5000);
+      }
+    } catch (_) {}
+  });
+
   client.on('interactionCreate', async (interaction) => {
     try {
-      // 1. スラッシュコマンド `/team`
-      if (interaction.isChatInputCommand() && interaction.commandName === 'team') {
-        const guild = interaction.guild;
+      // ==========================================
+      // A. スラッシュコマンド処理
+      // ==========================================
+      if (interaction.isChatInputCommand()) {
+        const { commandName, guild } = interaction;
         if (!guild) {
           return interaction.reply({
             content: '⚠️ このコマンドはDiscordサーバー内でのみ使用できます。',
@@ -562,97 +769,276 @@ async function setupBot(client, config = {}) {
           });
         }
 
-        let targetVc = interaction.options.getChannel('vc_channel');
-        if (!targetVc) {
-          const member = await guild.members.fetch(interaction.user.id);
-          targetVc = member.voice?.channel;
+        // 1. `/join` — 読み上げBotをVCに呼ぶ
+        if (commandName === 'join') {
+          let targetVc = interaction.options.getChannel('vc_channel');
+          if (!targetVc) {
+            const member = await guild.members.fetch(interaction.user.id);
+            targetVc = member.voice?.channel;
+          }
+
+          if (!targetVc) {
+            return interaction.reply({
+              content:
+                '⚠️ **参加先のVCが見つかりません。**\nボイスチャンネルに入ってから `/join` を実行するか、`vc_channel` オプションでVCを指定してください！',
+              ephemeral: true,
+            });
+          }
+
+          const voiceId = interaction.options.getString('voice') || 'zunda_normal';
+          const ttsSession = joinVcForTts(
+            guild,
+            targetVc,
+            interaction.channelId,
+            voiceId
+          );
+
+          const resolvedClientId = config.clientId || client.user?.id;
+          return interaction.reply(
+            buildTtsControlPayload(
+              ttsSession,
+              client.messageContentEnabled,
+              resolvedClientId
+            )
+          );
         }
 
-        if (!targetVc) {
+        // 2. `/leave` — 読み上げBotをVCから退出させる
+        if (commandName === 'leave') {
+          const existing = ttsSessions.get(guild.id);
+          if (!existing) {
+            return interaction.reply({
+              content: 'ℹ️ 現在このサーバーのVCには参加していません。',
+              ephemeral: true,
+            });
+          }
+          const vcName = existing.vcName;
+          existing.destroy();
           return interaction.reply({
-            content:
-              '⚠️ **VCチャンネルが認識できませんでした。**\nボイスチャンネルに入ってから `/team` を実行するか、`vc_channel` オプションで対象のVCを指定してください！',
-            ephemeral: true,
+            content: `👋 **🔊 ${vcName}** から退出しました！`,
           });
         }
 
-        const includeBots = interaction.options.getBoolean('include_bots') || false;
-        const allMembers = extractVcMembers(targetVc, includeBots);
+        // 3. `/voice` — 読み上げボイスの変更（個人 または サーバー全体）
+        if (commandName === 'voice') {
+          const voiceId = interaction.options.getString('voice', true);
+          const target = interaction.options.getString('target') || 'user';
+          const preset = VOICE_PRESETS[voiceId] || VOICE_PRESETS.zunda_normal;
 
-        if (allMembers.length === 0) {
+          if (target === 'guild') {
+            const existing = ttsSessions.get(guild.id);
+            if (existing) {
+              existing.defaultVoice = voiceId;
+            }
+            return interaction.reply({
+              content: `🌐 サーバー全体のデフォルト読み上げボイスを **${preset.emoji} ${preset.name}** に変更しました！`,
+            });
+          } else {
+            userVoicePrefs.set(interaction.user.id, voiceId);
+            return interaction.reply({
+              content: `👤 <@${interaction.user.id}> さんの読み上げボイスを **${preset.emoji} ${preset.name}** に設定しました！`,
+              ephemeral: true,
+            });
+          }
+        }
+
+        // 4. `/say` — 指定したテキストをVCで直接読み上げる
+        if (commandName === 'say') {
+          const text = interaction.options.getString('text', true);
+          const voiceOpt = interaction.options.getString('voice');
+          let ttsSession = ttsSessions.get(guild.id);
+
+          if (!ttsSession) {
+            const member = await guild.members.fetch(interaction.user.id);
+            const userVc = member.voice?.channel;
+            if (!userVc) {
+              return interaction.reply({
+                content: '⚠️ ボイスチャンネルに入ってから `/say` を実行するか、先に `/join` でBotをVCに呼んでください。',
+                ephemeral: true,
+              });
+            }
+            ttsSession = joinVcForTts(
+              guild,
+              userVc,
+              interaction.channelId,
+              voiceOpt || 'zunda_normal'
+            );
+          }
+
+          const voiceId =
+            voiceOpt ||
+            userVoicePrefs.get(interaction.user.id) ||
+            ttsSession.defaultVoice;
+          const cleaned = sanitizeTextForTts(text, guild);
+          ttsSession.enqueue(cleaned, voiceId);
+
+          const preset = VOICE_PRESETS[voiceId] || VOICE_PRESETS.zunda_normal;
           return interaction.reply({
-            content: `⚠️ **🔊 ${targetVc.name}** には現在メンバーがいません。（Botを含めてテストする場合は \`include_bots: True\` を指定してください）`,
-            ephemeral: true,
+            content: `🗣️ **${preset.emoji} ${preset.name}**: 「${cleaned}」`,
           });
         }
 
-        const presetKey = interaction.options.getString('preset');
-        const prioritySizeOpt = interaction.options.getInteger('priority_size');
-        const groupCountOpt = interaction.options.getInteger('group_count');
-        const customSizesOpt = interaction.options.getString('custom_sizes');
+        // 5. `/team` — VCメンバー自動認識＆チーム振り分けパネル表示
+        if (commandName === 'team') {
+          let targetVc = interaction.options.getChannel('vc_channel');
+          if (!targetVc) {
+            const member = await guild.members.fetch(interaction.user.id);
+            targetVc = member.voice?.channel;
+          }
 
-        let splitOptions = {
-          excludedIds: [],
-          priorityIds: [],
-          mode: 'priority',
-          prioritySize: 5,
-          maxPriorityTeams: null,
-          groupCount: 2,
-          customSizes: [],
-        };
-        let activePresetId = 'valo_5';
+          if (!targetVc) {
+            return interaction.reply({
+              content:
+                '⚠️ **VCチャンネルが認識できませんでした。**\nボイスチャンネルに入ってから `/team` を実行するか、`vc_channel` オプションで対象のVCを指定してください！',
+              ephemeral: true,
+            });
+          }
 
-        if (customSizesOpt) {
-          splitOptions.mode = 'custom';
-          splitOptions.customSizes = parseCustomSizes(customSizesOpt);
-          activePresetId = 'custom';
-        } else if (groupCountOpt) {
-          splitOptions.mode = 'groups';
-          splitOptions.groupCount = groupCountOpt;
-          activePresetId = `equal_${groupCountOpt}`;
-        } else if (prioritySizeOpt) {
-          splitOptions.mode = 'priority';
-          splitOptions.prioritySize = prioritySizeOpt;
-          activePresetId = 'custom_priority';
-        } else if (presetKey && PRESETS[presetKey]) {
-          const p = PRESETS[presetKey];
-          splitOptions = { ...splitOptions, ...p };
-          activePresetId = presetKey;
-        } else {
-          splitOptions = { ...splitOptions, ...PRESETS.valo_5 };
-          activePresetId = 'valo_5';
+          const includeBots = interaction.options.getBoolean('include_bots') || false;
+          const allMembers = extractVcMembers(targetVc, includeBots);
+
+          if (allMembers.length === 0) {
+            return interaction.reply({
+              content: `⚠️ **🔊 ${targetVc.name}** には現在メンバーがいません。（Botを含めてテストする場合は \`include_bots: True\` を指定してください）`,
+              ephemeral: true,
+            });
+          }
+
+          const presetKey = interaction.options.getString('preset');
+          const prioritySizeOpt = interaction.options.getInteger('priority_size');
+          const groupCountOpt = interaction.options.getInteger('group_count');
+          const customSizesOpt = interaction.options.getString('custom_sizes');
+
+          let splitOptions = {
+            excludedIds: [],
+            priorityIds: [],
+            mode: 'priority',
+            prioritySize: 5,
+            maxPriorityTeams: null,
+            groupCount: 2,
+            customSizes: [],
+          };
+          let activePresetId = 'valo_5';
+
+          if (customSizesOpt) {
+            splitOptions.mode = 'custom';
+            splitOptions.customSizes = parseCustomSizes(customSizesOpt);
+            activePresetId = 'custom';
+          } else if (groupCountOpt) {
+            splitOptions.mode = 'groups';
+            splitOptions.groupCount = groupCountOpt;
+            activePresetId = `equal_${groupCountOpt}`;
+          } else if (prioritySizeOpt) {
+            splitOptions.mode = 'priority';
+            splitOptions.prioritySize = prioritySizeOpt;
+            activePresetId = 'custom_priority';
+          } else if (presetKey && PRESETS[presetKey]) {
+            const p = PRESETS[presetKey];
+            splitOptions = { ...splitOptions, ...p };
+            activePresetId = presetKey;
+          } else {
+            splitOptions = { ...splitOptions, ...PRESETS.valo_5 };
+            activePresetId = 'valo_5';
+          }
+
+          const sessionId = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+          const session = {
+            id: sessionId,
+            createdAt: Date.now(),
+            guildId: guild.id,
+            vcId: targetVc.id,
+            vcName: targetVc.name,
+            includeBots,
+            presetId: activePresetId,
+            allMembers,
+            options: splitOptions,
+            isDrawn: false,
+            result: null,
+            moveTargets: {},
+          };
+          sessions.set(sessionId, session);
+
+          return interaction.reply({
+            embeds: [buildResultEmbed(session)],
+            components: buildControlComponents(session, publicUrl),
+          });
         }
-
-        const sessionId = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-
-        // 初期状態は isDrawn: false（まだチーム振り分けを実行せず、確定枠・除外枠を選べる準備画面）
-        const session = {
-          id: sessionId,
-          createdAt: Date.now(),
-          guildId: guild.id,
-          vcId: targetVc.id,
-          vcName: targetVc.name,
-          includeBots,
-          presetId: activePresetId,
-          allMembers,
-          options: splitOptions,
-          isDrawn: false,
-          result: null,
-          moveTargets: {},
-        };
-        sessions.set(sessionId, session);
-
-        return interaction.reply({
-          embeds: [buildResultEmbed(session)],
-          components: buildControlComponents(session, publicUrl),
-        });
       }
 
-      // 2. セレクトメニュー＆ボタン操作
+      // ==========================================
+      // B. セレクトメニュー＆ボタン操作
+      // ==========================================
       if (interaction.isStringSelectMenu() || interaction.isButton()) {
         const parts = interaction.customId.split('_');
         const act = parts[0];
 
+        // --- 読み上げBot (TTS) パネルのボタン・プルダウン操作 ---
+        if (act === 'ttsvoice' && interaction.isStringSelectMenu()) {
+          const gId = parts.slice(1).join('_');
+          const ttsSession = ttsSessions.get(gId);
+          if (!ttsSession) {
+            return interaction.reply({
+              content: '⚠️ 読み上げBotは現在VCに参加していません。`/join` で呼び出してください。',
+              ephemeral: true,
+            });
+          }
+          const chosenVoice = interaction.values[0];
+          ttsSession.defaultVoice = chosenVoice;
+          const preset = VOICE_PRESETS[chosenVoice] || VOICE_PRESETS.zunda_normal;
+          ttsSession.enqueue(`${preset.name}に変更したのだ`, chosenVoice);
+
+          const resolvedClientId = config.clientId || client.user?.id;
+          return interaction.update(
+            buildTtsControlPayload(
+              ttsSession,
+              client.messageContentEnabled,
+              resolvedClientId
+            )
+          );
+        }
+
+        if (act === 'ttsskip' && interaction.isButton()) {
+          const gId = parts.slice(1).join('_');
+          const ttsSession = ttsSessions.get(gId);
+          if (ttsSession) ttsSession.skip();
+          return interaction.deferUpdate();
+        }
+
+        if (act === 'ttsname' && interaction.isButton()) {
+          const gId = parts.slice(1).join('_');
+          const ttsSession = ttsSessions.get(gId);
+          if (!ttsSession) {
+            return interaction.reply({
+              content: '⚠️ 読み上げBotは現在VCに参加していません。',
+              ephemeral: true,
+            });
+          }
+          ttsSession.readSpeakerName = !ttsSession.readSpeakerName;
+          const resolvedClientId = config.clientId || client.user?.id;
+          return interaction.update(
+            buildTtsControlPayload(
+              ttsSession,
+              client.messageContentEnabled,
+              resolvedClientId
+            )
+          );
+        }
+
+        if (act === 'ttsleave' && interaction.isButton()) {
+          const gId = parts.slice(1).join('_');
+          const ttsSession = ttsSessions.get(gId);
+          if (ttsSession) {
+            ttsSession.destroy();
+          }
+          return interaction.update({
+            content: '👋 読み上げBotがVCから退出しました。再度呼ぶときは `/join` を実行してください！',
+            embeds: [],
+            components: [],
+          });
+        }
+
+        // --- チーム分け (`/team`) パネルの操作 ---
         if (act === 'movetarget') {
           const teamIdx = parts.pop();
           const sId = parts.slice(1).join('_');
@@ -677,7 +1063,31 @@ async function setupBot(client, config = {}) {
           });
         }
 
-        // プリセット変更（設定を更新し、「🎲 チーム振り分け」ボタンを押すまで待機状態にする）
+        // `/team` パネルの「🗣️ 読み上げBotを呼ぶ」ボタン
+        if (act === 'ttsjoin' && interaction.isButton()) {
+          const vc = interaction.guild.channels.cache.get(session.vcId);
+          if (!vc) {
+            return interaction.reply({
+              content: '⚠️ 対象のVCチャンネルが見つかりません。',
+              ephemeral: true,
+            });
+          }
+          const ttsSession = joinVcForTts(
+            interaction.guild,
+            vc,
+            interaction.channelId,
+            'zunda_normal'
+          );
+          const resolvedClientId = config.clientId || client.user?.id;
+          return interaction.reply(
+            buildTtsControlPayload(
+              ttsSession,
+              client.messageContentEnabled,
+              resolvedClientId
+            )
+          );
+        }
+
         if (act === 'preset' && interaction.isStringSelectMenu()) {
           const chosenKey = interaction.values[0];
           const preset = PRESETS[chosenKey];
@@ -701,7 +1111,6 @@ async function setupBot(client, config = {}) {
           });
         }
 
-        // ⭐ フルパ確定メンバー選択変更（選んだ人が除外枠にいた場合は除外から外す）
         if (act === 'priority' && interaction.isStringSelectMenu()) {
           session.options.priorityIds = interaction.values;
           const prioSet = new Set(interaction.values);
@@ -716,7 +1125,6 @@ async function setupBot(client, config = {}) {
           });
         }
 
-        // 👀 除外メンバー選択変更（選んだ人がフルパ確定枠にいた場合は確定枠から外す）
         if (act === 'exclude' && interaction.isStringSelectMenu()) {
           session.options.excludedIds = interaction.values;
           const exclSet = new Set(interaction.values);
@@ -731,18 +1139,26 @@ async function setupBot(client, config = {}) {
           });
         }
 
-        // 🎲 チーム振り分けボタン（ここで初めて抽選・振り分けを実行！2回目以降は再抽選として機能）
         if (act === 'reroll' && interaction.isButton()) {
           session.result = splitMembers(session.allMembers, session.options);
           session.isDrawn = true;
           session.moveTargets = {};
+
+          // もし読み上げBotがそのVCに参加していれば、抽選完了をずんだもん/ゆっくりボイスでアナウンス！
+          const ttsSession = ttsSessions.get(interaction.guild.id);
+          if (ttsSession && ttsSession.vcId === session.vcId) {
+            const announceText = ttsSession.defaultVoice.startsWith('zunda')
+              ? 'チーム振り分けが完了したのだ！結果を確認してほしいのだ！'
+              : 'チーム振り分けが完了しました。結果を確認してください。';
+            ttsSession.enqueue(announceText, ttsSession.defaultVoice);
+          }
+
           return interaction.update({
             embeds: [buildResultEmbed(session)],
             components: buildControlComponents(session, publicUrl),
           });
         }
 
-        // 📡 VCメンバー再認識ボタン
         if (act === 'refresh' && interaction.isButton()) {
           const vc = interaction.guild.channels.cache.get(session.vcId);
           if (vc) {
@@ -756,7 +1172,6 @@ async function setupBot(client, config = {}) {
           });
         }
 
-        // 🔊 別のVCへ移動...ボタン
         if (act === 'askmove' && interaction.isButton()) {
           if (!session.isDrawn || !session.result) {
             return interaction.reply({
