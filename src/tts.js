@@ -1,8 +1,7 @@
 /**
- * Discord VC 読み上げBot (TTS) エンジン
- * - ずんだもん / 四国めたん / 春日部つむぎ / 冥鳴ひまり (VOICEVOX Web API: tts.quest v3)
- * - ゆっくりボイス 霊夢風 / 魔理沙風 (Google TTS + FFmpeg 音響フィルタによる高速・無制限合成)
- * - VC内テキストチャットおよびコマンド実行チャンネルの自動読み上げキュー管理
+ * Discord VC 読み上げBot (TTS) エンジン (純粋JS WAV PCMアップサンプラー搭載・FFmpeg不要で動作)
+ * - ずんだもん / 四国めたん / 春日部つむぎ / 冥鳴ひまり / ゆっくり風ボイス
+ * - 24kHz 16bit Mono WAV を純粋Node.jsで 48kHz 16bit Stereo s16le PCM に変換して再生
  */
 
 const {
@@ -16,16 +15,7 @@ const {
   NoSubscriberBehavior,
 } = require('@discordjs/voice');
 const { spawn } = require('child_process');
-const { PassThrough } = require('stream');
-
-let ffmpegStaticPath = null;
-try {
-  ffmpegStaticPath = require('ffmpeg-static');
-} catch (_) {}
-
-function getFfmpegCommand() {
-  return process.env.FFMPEG_PATH || ffmpegStaticPath || 'ffmpeg';
-}
+const { Readable, PassThrough } = require('stream');
 
 /**
  * 選択可能な読み上げボイス一覧
@@ -37,6 +27,7 @@ const VOICE_PRESETS = {
     description: 'VOICEVOX 定番の元気なずんだもんボイスなのだ！',
     engine: 'voicevox',
     speakerId: 3,
+    pitchStep: 1.0,
     emoji: '🟢',
   },
   zunda_amaama: {
@@ -45,6 +36,7 @@ const VOICE_PRESETS = {
     description: 'VOICEVOX 甘えん坊なずんだもんボイス',
     engine: 'voicevox',
     speakerId: 1,
+    pitchStep: 1.0,
     emoji: '💚',
   },
   zunda_tsun: {
@@ -53,6 +45,7 @@ const VOICE_PRESETS = {
     description: 'VOICEVOX ツンツンしたずんだもんボイス',
     engine: 'voicevox',
     speakerId: 7,
+    pitchStep: 1.0,
     emoji: '💢',
   },
   zunda_sasayaki: {
@@ -61,24 +54,27 @@ const VOICE_PRESETS = {
     description: 'VOICEVOX ささやき声のずんだもんボイス',
     engine: 'voicevox',
     speakerId: 22,
+    pitchStep: 1.0,
     emoji: '🍃',
   },
   yukkuri_reimu: {
     id: 'yukkuri_reimu',
-    name: 'ゆっくりボイス（霊夢風・高速）',
-    description: '待ち時間ゼロでサクサク読み上げる定番ゆっくり風ボイス',
-    engine: 'yukkuri',
-    pitchRate: 1.12,
-    tempoRate: 0.96,
+    name: 'ゆっくりボイス（霊夢風）',
+    description: '定番のゆっくり霊夢風トーンで読み上げます',
+    engine: 'voicevox',
+    speakerId: 47, // ナースロボ＿タイプＴをベースにゆっくりトーン化（フォールバック時はGoogleTTS+FFmpeg）
+    pitchStep: 1.06,
+    preferYukkuriFallback: true,
     emoji: '🎀',
   },
   yukkuri_marisa: {
     id: 'yukkuri_marisa',
-    name: 'ゆっくりボイス（魔理沙風・低め）',
-    description: '少し低めで聞き取りやすいゆっくり魔理沙風ボイス',
-    engine: 'yukkuri',
-    pitchRate: 0.96,
-    tempoRate: 1.08,
+    name: 'ゆっくりボイス（魔理沙風）',
+    description: '少し低めで聞き取りやすいゆっくり魔理沙風トーン',
+    engine: 'voicevox',
+    speakerId: 2,
+    pitchStep: 0.94,
+    preferYukkuriFallback: true,
     emoji: '🌟',
   },
   metan_normal: {
@@ -87,6 +83,7 @@ const VOICE_PRESETS = {
     description: 'VOICEVOX はっきり聞き取りやすいお嬢様ボイス',
     engine: 'voicevox',
     speakerId: 2,
+    pitchStep: 1.0,
     emoji: '🎀',
   },
   tsumugi: {
@@ -95,6 +92,7 @@ const VOICE_PRESETS = {
     description: 'VOICEVOX 明るい埼玉ギャルボイス',
     engine: 'voicevox',
     speakerId: 8,
+    pitchStep: 1.0,
     emoji: '🌻',
   },
   himari: {
@@ -103,6 +101,7 @@ const VOICE_PRESETS = {
     description: 'VOICEVOX 落ち着いた優しい死神ボイス',
     engine: 'voicevox',
     speakerId: 14,
+    pitchStep: 1.0,
     emoji: '🔮',
   },
   nurserobo: {
@@ -111,14 +110,12 @@ const VOICE_PRESETS = {
     description: 'VOICEVOX クールなロボットナースボイス',
     engine: 'voicevox',
     speakerId: 47,
+    pitchStep: 1.0,
     emoji: '🤖',
   },
 };
 
-// サーバーごとの読み上げセッション管理 (guildId -> GuildTtsSession)
 const ttsSessions = new Map();
-
-// ユーザー個人のボイス設定 (userId -> voiceId)
 const userVoicePrefs = new Map();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -130,14 +127,10 @@ function sanitizeTextForTts(rawText, guild) {
   if (!rawText) return '';
   let text = String(rawText);
 
-  // コードブロック省略
   text = text.replace(/```[\s\S]*?```/g, ' コードブロック省略 ');
-  // ネタバレ伏せ字
   text = text.replace(/\|\|[\s\S]*?\|\|/g, ' ネタバレ ');
-  // URL省略
   text = text.replace(/https?:\/\/\S+/gi, ' URL省略 ');
 
-  // ユーザーメンション <@12345> を名前に変換
   text = text.replace(/<@!?(\d+)>/g, (_, id) => {
     if (guild) {
       const m = guild.members.cache.get(id);
@@ -146,7 +139,6 @@ function sanitizeTextForTts(rawText, guild) {
     return '';
   });
 
-  // ロールメンション・チャンネルメンション
   text = text.replace(/<@&(\d+)>/g, '');
   text = text.replace(/<#(\d+)>/g, (_, id) => {
     if (guild) {
@@ -156,16 +148,10 @@ function sanitizeTextForTts(rawText, guild) {
     return 'チャンネル';
   });
 
-  // カスタム絵文字 <:name:12345> -> name
   text = text.replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, '$1');
-
-  // 単体の草 (w / ｗ) を「わら」に変換
   text = text.replace(/(?:^|\s)[wｗ]{1,6}(?=$|\s|[!！?？。、])/gi, ' わら ');
-
-  // 改行や連続空白を整理
   text = text.replace(/\s+/g, ' ').trim();
 
-  // 長文カット（110文字超は以下略）
   if (text.length > 110) {
     text = text.slice(0, 110) + '、以下略';
   }
@@ -174,43 +160,68 @@ function sanitizeTextForTts(rawText, guild) {
 }
 
 /**
- * MP3 バッファを FFmpeg で 48kHz Stereo s16le PCM ストリームに変換する
+ * 純粋Node.jsで 16-bit WAV バッファを 48kHz Stereo s16le PCM にリサンプリング変換する（FFmpeg不要）
  */
-function createPcmResourceFromMp3Buffer(mp3Buffer, audioFilter = null) {
-  const ffmpegCmd = getFfmpegCommand();
-  const args = ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0'];
+function wavBufferTo48kStereoPcmResource(wavBuf, pitchStep = 1.0) {
+  const channels = wavBuf.readUInt16LE(22) || 1;
+  const inSampleRate = wavBuf.readUInt32LE(24) || 24000;
 
-  if (audioFilter) {
-    args.push('-af', audioFilter);
+  // 'data' チャンクの開始位置を探す
+  let dataOffset = 44;
+  let dataLength = wavBuf.length - 44;
+  for (let i = 12; i < Math.min(wavBuf.length - 8, 256); i++) {
+    if (
+      wavBuf[i] === 0x64 && // 'd'
+      wavBuf[i + 1] === 0x61 && // 'a'
+      wavBuf[i + 2] === 0x74 && // 't'
+      wavBuf[i + 3] === 0x61 // 'a'
+    ) {
+      dataLength = wavBuf.readUInt32LE(i + 4);
+      dataOffset = i + 8;
+      break;
+    }
   }
 
-  args.push('-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1');
+  const availableBytes = Math.min(dataLength, wavBuf.length - dataOffset);
+  const frameSize = channels * 2;
+  const totalInFrames = Math.floor(availableBytes / frameSize);
 
-  const ff = spawn(ffmpegCmd, args, {
-    stdio: ['pipe', 'pipe', 'ignore'],
-  });
+  const outSampleRate = 48000;
+  const step = (inSampleRate / outSampleRate) * (pitchStep || 1.0);
+  const totalOutFrames = Math.max(1, Math.floor(totalInFrames / step));
 
-  const outputStream = new PassThrough();
-  ff.stdout.pipe(outputStream);
+  // 48kHz Stereo 16-bit = 1フレームあたり 4 bytes (Left 2B + Right 2B)
+  const outBuf = Buffer.alloc(totalOutFrames * 4);
 
-  ff.on('error', (err) => {
-    console.error('FFmpeg spawn error:', err.message);
-    outputStream.end();
-  });
+  for (let outIdx = 0; outIdx < totalOutFrames; outIdx++) {
+    const srcPos = outIdx * step;
+    const idx0 = Math.min(totalInFrames - 1, Math.floor(srcPos));
+    const idx1 = Math.min(totalInFrames - 1, idx0 + 1);
+    const frac = srcPos - idx0;
 
-  ff.stdin.on('error', () => {});
-  ff.stdin.end(mp3Buffer);
+    const sample0 = wavBuf.readInt16LE(dataOffset + idx0 * frameSize);
+    const sample1 = wavBuf.readInt16LE(dataOffset + idx1 * frameSize);
+    const interpolated = Math.max(
+      -32768,
+      Math.min(32767, Math.round(sample0 + (sample1 - sample0) * frac))
+    );
 
-  return createAudioResource(outputStream, {
+    const outByteOffset = outIdx * 4;
+    outBuf.writeInt16LE(interpolated, outByteOffset);
+    outBuf.writeInt16LE(interpolated, outByteOffset + 2);
+  }
+
+  const stream = Readable.from([outBuf]);
+  return createAudioResource(stream, {
     inputType: StreamType.Raw,
     inlineVolume: true,
   });
 }
 
 /**
- * ゆっくりボイス（Google TTS + FFmpeg ゆっくり音響フィルタ）でMP3を合成
+ * FFmpegが利用可能な場合の Google TTS ゆっくりボイス合成
  */
-async function synthesizeYukkuriMp3(text, preset) {
+async function synthesizeGoogleYukkuriWithFfmpeg(text, pitchRate = 1.12, tempoRate = 0.96) {
   const safeText = text.slice(0, 180);
   const url =
     `https://translate.google.com/translate_tts?ie=UTF-8&tl=ja&client=tw-ob` +
@@ -230,19 +241,29 @@ async function synthesizeYukkuriMp3(text, preset) {
   const arrayBuf = await res.arrayBuffer();
   const mp3Buf = Buffer.from(arrayBuf);
 
-  const pitch = preset?.pitchRate || 1.12;
-  const tempo = preset?.tempoRate || 0.96;
-  // ピッチ変更＋テンポ補正でゆっくりボイス特有の声質を作る
-  const filter = `asetrate=24000*${pitch},aresample=48000,atempo=${tempo}`;
+  const filter = `asetrate=24000*${pitchRate},aresample=48000,atempo=${tempoRate}`;
+  const ff = spawn(
+    'ffmpeg',
+    ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-af', filter, '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'],
+    { stdio: ['pipe', 'pipe', 'ignore'] }
+  );
 
-  return createPcmResourceFromMp3Buffer(mp3Buf, filter);
+  const outputStream = new PassThrough();
+  ff.stdout.pipe(outputStream);
+  ff.on('error', () => outputStream.end());
+  ff.stdin.on('error', () => {});
+  ff.stdin.end(mp3Buf);
+
+  return createAudioResource(outputStream, {
+    inputType: StreamType.Raw,
+    inlineVolume: true,
+  });
 }
 
 /**
- * VOICEVOX Web API (tts.quest v3) でずんだもん等の音声を合成
- * API混雑時は自動的にゆっくりボイスへフォールバックして無音を防ぐ
+ * VOICEVOX Web API (tts.quest v3) から WAV を取得し、純粋JSで 48kHz Stereo PCM リソースを生成
  */
-async function synthesizeVoicevoxResource(text, preset) {
+async function synthesizeVoicevoxWavResource(text, preset) {
   const speakerId = preset.speakerId ?? 3;
   const apiKey = process.env.VOICEVOX_API_KEY || '';
   let apiUrl =
@@ -252,55 +273,43 @@ async function synthesizeVoicevoxResource(text, preset) {
     apiUrl += `&key=${encodeURIComponent(apiKey)}`;
   }
 
-  const res = await fetch(apiUrl);
-  const data = await res.json();
+  let res = await fetch(apiUrl);
+  let data = await res.json();
 
-  // レート制限 (retryAfter) が返ってきた場合は少し待つかフォールバック
   if (!data.success && data.retryAfter) {
     const waitSec = Math.min(Number(data.retryAfter) || 2, 4);
     await sleep(waitSec * 1000);
-    const retryRes = await fetch(apiUrl);
-    const retryData = await retryRes.json();
-    if (!retryData.success || !retryData.mp3DownloadUrl) {
-      return synthesizeYukkuriMp3(text, VOICE_PRESETS.yukkuri_reimu);
-    }
-    return downloadVoicevoxMp3WhenReady(retryData);
+    res = await fetch(apiUrl);
+    data = await res.json();
   }
 
-  if (!data.success || !data.mp3DownloadUrl) {
-    return synthesizeYukkuriMp3(text, VOICE_PRESETS.yukkuri_reimu);
+  if (!data.success || !data.wavDownloadUrl) {
+    throw new Error('tts.quest synthesis unavailable');
   }
 
-  return downloadVoicevoxMp3WhenReady(data);
-}
-
-async function downloadVoicevoxMp3WhenReady(data) {
   const statusUrl = data.audioStatusUrl;
-  const mp3Url = data.mp3DownloadUrl;
+  const wavUrl = data.wavDownloadUrl;
 
-  // 最大12秒間（400ms × 30回）生成完了をポーリング
   for (let i = 0; i < 30; i++) {
     try {
       const stRes = await fetch(statusUrl);
       if (stRes.ok) {
         const st = await stRes.json();
         if (st.isAudioReady) break;
-        if (st.isAudioError) {
-          throw new Error('VOICEVOX audio synthesis error');
-        }
+        if (st.isAudioError) throw new Error('VOICEVOX synthesis error');
       }
     } catch (_) {}
     await sleep(400);
   }
 
-  const audioRes = await fetch(mp3Url);
-  if (!audioRes.ok) {
-    throw new Error(`Failed to download VOICEVOX mp3: ${audioRes.status}`);
+  const wavRes = await fetch(wavUrl);
+  if (!wavRes.ok) {
+    throw new Error(`WAV download HTTP ${wavRes.status}`);
   }
-  const arrayBuf = await audioRes.arrayBuffer();
-  const mp3Buf = Buffer.from(arrayBuf);
+  const arrayBuf = await wavRes.arrayBuffer();
+  const wavBuf = Buffer.from(arrayBuf);
 
-  return createPcmResourceFromMp3Buffer(mp3Buf, null);
+  return wavBufferTo48kStereoPcmResource(wavBuf, preset.pitchStep || 1.0);
 }
 
 /**
@@ -310,13 +319,14 @@ async function createTtsAudioResource(text, voiceId = 'zunda_normal') {
   const preset = VOICE_PRESETS[voiceId] || VOICE_PRESETS.zunda_normal;
 
   try {
-    if (preset.engine === 'yukkuri') {
-      return await synthesizeYukkuriMp3(text, preset);
-    }
-    return await synthesizeVoicevoxResource(text, preset);
+    return await synthesizeVoicevoxWavResource(text, preset);
   } catch (err) {
-    console.warn(`⚠️ TTS合成フォールバック (${preset.name}):`, err.message);
-    return await synthesizeYukkuriMp3(text, VOICE_PRESETS.yukkuri_reimu);
+    console.warn(`⚠️ VOICEVOX合成フォールバック (${preset.name}):`, err.message);
+    return await synthesizeGoogleYukkuriWithFfmpeg(
+      text,
+      preset.pitchStep || 1.12,
+      0.96
+    );
   }
 }
 
@@ -329,9 +339,8 @@ class GuildTtsSession {
     this.vcId = vcChannel.id;
     this.vcName = vcChannel.name;
     this.defaultVoice = VOICE_PRESETS[defaultVoice] ? defaultVoice : 'zunda_normal';
-    this.readSpeakerName = false; // 発言者名を読むかどうか
+    this.readSpeakerName = false;
 
-    // 読み上げ対象のチャンネルIDセット（VC自体のテキストチャット ＋ `/join` を実行したチャンネル）
     this.boundChannelIds = new Set([vcChannel.id]);
     if (textChannelId) {
       this.boundChannelIds.add(textChannelId);
@@ -429,9 +438,6 @@ class GuildTtsSession {
   }
 }
 
-/**
- * VCに読み上げBotを参加させる（すでに接続中なら移動または設定更新）
- */
 function joinVcForTts(guild, vcChannel, textChannelId, voiceId = 'zunda_normal') {
   const existing = ttsSessions.get(guild.id);
   if (existing) {
@@ -440,8 +446,6 @@ function joinVcForTts(guild, vcChannel, textChannelId, voiceId = 'zunda_normal')
   const session = new GuildTtsSession(guild, vcChannel, textChannelId, voiceId);
   ttsSessions.set(guild.id, session);
 
-  // 入室挨拶を読み上げ
-  const preset = VOICE_PRESETS[session.defaultVoice];
   const greeting =
     session.defaultVoice.startsWith('zunda')
       ? '読み上げを開始するのだ！よろしくなのだ！'
@@ -456,5 +460,6 @@ module.exports = {
   ttsSessions,
   userVoicePrefs,
   sanitizeTextForTts,
+  wavBufferTo48kStereoPcmResource,
   joinVcForTts,
 };
